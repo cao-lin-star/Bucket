@@ -1,0 +1,29 @@
+# Keil user-specific settings
+*.uvguix.*
+
+# Keil compiler/linker intermediate files
+*.o
+*.obj
+*.crf
+*.d
+*.axf
+*.map
+*.lst
+*.dep
+*.sct
+*.htm
+*.build_log.htm
+
+# Keil build output directory; keep the final flash image
+MDK-ARM/Foot_bath_robot1/*
+!MDK-ARM/Foot_bath_robot1/*.hex
+
+# Generated RTE metadata and local build logs
+MDK-ARM/RTE/
+MDK-ARM/build*.log
+MDK-ARM/base_build.log
+
+# Editor/backup files
+*.Bak
+*.bak
+*~
