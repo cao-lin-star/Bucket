@@ -41,9 +41,9 @@ extern "C" {
 #define TEMP_HEAT_TIMEOUT_MS        (15UL * 60UL * 1000UL)
 #endif
 
-#ifndef TEMP_PREHEAT_DRAIN_MS
-/* 每次真正需要打开加热片前，先排空管道，避免管路无水导致加热空烧。 */
-#define TEMP_PREHEAT_DRAIN_MS       5000UL
+#ifndef TEMP_PREHEAT_CIRCULATION_MS
+/* 每次真正需要打开加热片前，先内循环 5 秒，使加热管内充满水，避免空烧。 */
+#define TEMP_PREHEAT_CIRCULATION_MS 5000UL
 #endif
 
 void Temp_Init(void);

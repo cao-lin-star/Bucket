@@ -8,8 +8,8 @@
 
 ```text
 Core/             CubeMX 生成的启动、外设初始化和中断入口
-Hardware/         传感器、泵阀、电机、UV、灯光等硬件控制
-Application/      温控、充电、系统监控、日志等业务逻辑
+Hardware/         ADC/DMA/输入捕获采集，以及泵阀、电机、UV、灯光等硬件控制
+Application/      传感器业务换算、温控、充电、系统监控、日志等业务逻辑
 Communication/    Linux/基站通信、协议解析和状态组包
 RTOS/             FreeRTOS 各任务的周期执行入口
 Middlewares/      FreeRTOS 内核
@@ -37,7 +37,7 @@ RTOS
 
 ### Hardware
 
-- `sensor.*`
+- `sensor_acquisition.*`：ADC/DMA/TIM3 初始化、六路 ADC 滤波和水位脉冲采集
 - `pump_valve.*`
 - `motor_control.*`
 - `uv_lamp.*`
@@ -46,7 +46,8 @@ RTOS
 ### Application
 
 - `app_bucket.*`：所有桶体模块的统一初始化入口
-- `temp_control.*`：加热、恒温和加热前 5 秒管道排空
+- `sensor.*`：把滤波 ADC/水位脉冲换算为最终业务值并维护快照
+- `temp_control.*`：加热、恒温和加热前 5 秒预循环（使加热管充满水）
 - `power_manager.*`：基站连接条件下的充电状态机
 - `system_monitor.*`：状态、定时和故障监控
 - `log.*`：运行日志

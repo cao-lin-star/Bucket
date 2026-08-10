@@ -13,9 +13,9 @@ extern "C" {
 #define PUMP_CURRENT_MAX_MA          3000U
 #endif
 
-//排水模式超时时间：5分钟
+//排水模式超时时间：8分钟
 #ifndef PUMP_VALVE_DRAIN_TIMEOUT_MS
-#define PUMP_VALVE_DRAIN_TIMEOUT_MS  (5UL * 60UL * 1000UL)
+#define PUMP_VALVE_DRAIN_TIMEOUT_MS  (8UL * 60UL * 1000UL)
 #endif
 
 /*

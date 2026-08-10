@@ -17,6 +17,12 @@ void UV_Init(void)
 void UV_On(void)
 {
   /* 故障锁存时禁止点亮，必须先由上层显式清除故障。 */
+  if (uv_fault != 0U)
+  {
+    UV_Off();
+    return;
+  }
+
   uv_enabled = 1U;
   HAL_GPIO_WritePin(EN_UV_GPIO_Port, EN_UV_Pin, GPIO_PIN_SET);
 }
@@ -62,13 +68,10 @@ void UV_ClearFault(void)
 //作用：缺水保护 —— 有水才能开UV，没水自动关闭并报故障
 void UV_TaskProcess(void)
 {
-  /* 预留周期自检入口；后续可在此加入电流或反馈脚诊断。 */
-  //如果UV灯开启但水位过低，认为UV灯发生故障，立即关闭UV
-  /*
+  /* UV 运行中缺水时立即关闭并锁存故障，避免周期命令重新点亮。 */
   if ((uv_enabled != 0U) && (Sensor_GetWaterLevelProtocol() < SENSOR_WATER_MIN_SAFE_LITERS))
   {
     uv_fault = 1U;
     UV_Off();
   }
-    */
 }

@@ -115,7 +115,13 @@ void Motor_Init(void)
 //设置电机运行速度和方向
 void Motor_Run(uint8_t speed, uint8_t direction)
 {
-  /* 故障未清除时保持停机；有效启动同时刷新自动换向计时基准。 */
+  /* 故障未清除时保持停机，防止重复命令绕过过流锁存。 */
+  if ((motor_fault != 0U) && (speed != 0U))
+  {
+    Motor_Stop();
+    return;
+  }
+
   motor_direction = (direction != 0U) ? MOTOR_DIR_REVERSE : MOTOR_DIR_FORWARD;
   if (speed <= 3U)
   {
@@ -149,6 +155,14 @@ void Motor_SetLevel(uint8_t level)
   {
     level = 3U;
   }
+
+  /* 协议档位命令同样受故障锁存约束；0 档始终允许用于停机。 */
+  if ((motor_fault != 0U) && (level != 0U))
+  {
+    Motor_Stop();
+    return;
+  }
+
   motor_level = level;
   motor_manual_duty = 0U;
   motor_running = (level != 0U) ? 1U : 0U;

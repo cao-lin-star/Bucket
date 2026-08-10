@@ -630,14 +630,14 @@
               <FilePath>..\Hardware\pump_valve.h</FilePath>
             </File>
             <File>
-              <FileName>sensor.c</FileName>
+              <FileName>sensor_acquisition.c</FileName>
               <FileType>1</FileType>
-              <FilePath>..\Hardware\sensor.c</FilePath>
+              <FilePath>..\Hardware\sensor_acquisition.c</FilePath>
             </File>
             <File>
-              <FileName>sensor.h</FileName>
+              <FileName>sensor_acquisition.h</FileName>
               <FileType>5</FileType>
-              <FilePath>..\Hardware\sensor.h</FilePath>
+              <FilePath>..\Hardware\sensor_acquisition.h</FilePath>
             </File>
             <File>
               <FileName>uv_lamp.c</FileName>
@@ -663,6 +663,16 @@
               <FileName>app_bucket.h</FileName>
               <FileType>5</FileType>
               <FilePath>..\Application\app_bucket.h</FilePath>
+            </File>
+            <File>
+              <FileName>sensor.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Application\sensor.c</FilePath>
+            </File>
+            <File>
+              <FileName>sensor.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Application\sensor.h</FilePath>
             </File>
             <File>
               <FileName>log.c</FileName>
@@ -749,16 +759,16 @@
   </Targets>
 
   <RTE>
-    <apis />
+    <apis/>
     <components>
       <component Cclass="CMSIS" Cgroup="CORE" Cvendor="ARM" Cversion="4.3.0" condition="CMSIS Core">
-        <package name="CMSIS" schemaVersion="1.3" url="http://www.keil.com/pack/" vendor="ARM" version="4.5.0" />
+        <package name="CMSIS" schemaVersion="1.3" url="http://www.keil.com/pack/" vendor="ARM" version="4.5.0"/>
         <targetInfos>
-          <targetInfo name="Foot_bath_robot1" />
+          <targetInfo name="Foot_bath_robot1"/>
         </targetInfos>
       </component>
     </components>
-    <files />
+    <files/>
   </RTE>
 
 </Project>

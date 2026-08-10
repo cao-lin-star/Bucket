@@ -44,7 +44,20 @@ void PumpValve_Init(void)
 //设置泵/阀模式
 void PumpValve_SetMode(PumpValveMode_t mode)
 {
+  /* 非法模式按 OFF 处理，避免软件状态显示运行而 GPIO 实际已关闭。 */
+  if ((mode != PUMP_VALVE_MODE_OFF) &&
+      (mode != PUMP_VALVE_MODE_CIRCULATION) &&
+      (mode != PUMP_VALVE_MODE_DRAIN))
+  {
+    mode = PUMP_VALVE_MODE_OFF;
+  }
+
   /* 故障锁存期间拒绝重新启动，只允许切换到安全的 OFF 模式。 */
+  if ((pump_fault != 0U) && (mode != PUMP_VALVE_MODE_OFF))
+  {
+    return;
+  }
+
   if (mode != pump_mode)
   {
     pump_mode_start_tick = HAL_GetTick();

@@ -15,15 +15,15 @@
 #define SYSTEM_BAT_HIGH_DV           260U
 #endif
 
-static uint8_t system_main_status;    //系统主状态，0=上电 1=待机 2=运行 3=错误
-static uint8_t system_sub_status;     //系统子状态，预留给不同主状态下的细分状态使用，具体定义由上层应用决定
-static uint8_t system_err1;           //错误码1（水位、传感器、超温）
-static uint8_t system_err2;           //错误码2（加热、水泵、电机、UV、电池）
-static uint8_t system_last_cmd;       //保存最后一次接收的指令
-static uint8_t system_link_status;    //通信连接状态
-static uint8_t system_reset_requested;  //系统复位请求标志
-static uint32_t system_reset_tick;      //复位请求时间
-static uint32_t system_timer_deadline_tick;   //定时关机截止时间
+static uint8_t system_main_status;    /* BucketMainStatus_t 对应的协议主状态。 */
+static uint8_t system_sub_status;     /* 主状态下的细分状态，由业务命令定义。 */
+static uint8_t system_err1;           /* 传感器、温度和水位类错误位图。 */
+static uint8_t system_err2;           /* 执行器和电池类错误位图。 */
+static uint8_t system_last_cmd;       /* 最近一次有效业务命令。 */
+static uint8_t system_link_status;    /* 主控通信连接状态。 */
+static uint8_t system_reset_requested;  /* 延时复位请求标志。 */
+static uint32_t system_reset_tick;      /* 延时复位起始时刻。 */
+static uint32_t system_timer_deadline_tick;   /* 定时关机绝对截止时刻。 */
 
 //把指令里的时间编码（1~6）转换成对应的定时毫秒（10/15/20/25/30分钟）
 static uint32_t SystemMonitor_TimerCodeToMs(uint8_t timer_code)
@@ -59,14 +59,15 @@ void SystemMonitor_Init(void)
   system_timer_deadline_tick = 0UL;             // 定时关机时间清空
 }
 
-//关闭加热、电机、水泵、UV灯
+/* 所有全局停机路径必须经由此函数，确保执行器按同一安全顺序关闭。 */
 void SystemMonitor_StopAllOutputs(void)
 {
-  /*
+  /* 全局停机优先撤销外部加热接管，确保 EN_HEAT 一定被拉低。 */
+  Temp_SetExternalHeatControl(0U);
   Temp_Enable(0U);
   Motor_Stop();
   PumpValve_SetMode(PUMP_VALVE_MODE_OFF);
-  UV_Off();*/
+  UV_Off();
 }
 
 //设置系统主状态 + 子状态
@@ -161,7 +162,7 @@ uint8_t SystemMonitor_GetTimerRemainingMin(void)
   return (uint8_t)(remaining_ms / 60000UL);
 }
 
-//请求系统复位
+/* 返回向上取整的剩余秒数，供定时到期判断使用。 */
 uint32_t SystemMonitor_GetTimerRemainingSec(void)
 {
   uint32_t now;

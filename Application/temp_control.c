@@ -9,9 +9,9 @@ static uint8_t temp_enabled;
 static uint8_t temp_heating;
 static uint8_t temp_fault;
 static uint8_t temp_external_heat_control;
-static uint8_t temp_preheat_drain_active;
+static uint8_t temp_preheat_circulation_active;
 static uint32_t temp_heat_start_tick;
-static uint32_t temp_preheat_drain_start_tick;
+static uint32_t temp_preheat_circulation_start_tick;
 
 static float Temp_ClampTarget(float target)
 {
@@ -27,6 +27,7 @@ static float Temp_ClampTarget(float target)
   return target;
 }
 
+// 设置加热输出
 static void Temp_SetHeatOutput(uint8_t on)
 {
   GPIO_PinState state;
@@ -44,9 +45,9 @@ void Temp_Init(void)
   temp_heating = 0U;
   temp_fault = 0U;
   temp_external_heat_control = 0U;
-  temp_preheat_drain_active = 0U;
+  temp_preheat_circulation_active = 0U;
   temp_heat_start_tick = 0U;
-  temp_preheat_drain_start_tick = 0U;
+  temp_preheat_circulation_start_tick = 0U;
   Temp_SetHeatOutput(0U);
 }
 
@@ -72,12 +73,20 @@ float Temp_Read(void)
 
 void Temp_Enable(uint8_t enable)
 {
+  /* 锁存故障必须由 SystemMonitor_ClearErrors() 显式清除，周期命令不能重启加热。 */
+  if ((enable != 0U) && (temp_fault != 0U))
+  {
+    temp_enabled = 0U;
+    Temp_SetHeatOutput(0U);
+    return;
+  }
+
   temp_enabled = (enable != 0U) ? 1U : 0U;
   /* 外部接管期间只记录使能意图，不擅自改变物理输出。 */
   if ((temp_enabled == 0U) && (temp_external_heat_control == 0U))
   {
-    temp_preheat_drain_active = 0U;
-    temp_preheat_drain_start_tick = 0U;
+    temp_preheat_circulation_active = 0U;
+    temp_preheat_circulation_start_tick = 0U;
     Temp_SetHeatOutput(0U);
     temp_heat_start_tick = 0U;
   }
@@ -89,8 +98,8 @@ void Temp_SetExternalHeatControl(uint8_t enable)
   /* 退出接管时先关闭，下一周期再由本地控制器判断。 */
   if (temp_external_heat_control == 0U)
   {
-    temp_preheat_drain_active = 0U;
-    temp_preheat_drain_start_tick = 0U;
+    temp_preheat_circulation_active = 0U;
+    temp_preheat_circulation_start_tick = 0U;
     Temp_SetHeatOutput(0U);
     temp_heat_start_tick = 0U;
   }
@@ -98,10 +107,17 @@ void Temp_SetExternalHeatControl(uint8_t enable)
 
 void Temp_SetExternalHeatOutput(uint8_t on)
 {
-  /* 外部状态机接管后，本地回差及超时逻辑均暂停。 */
+  /* 外部状态机可接管回差控制，但不得绕过已经锁存的加热故障。 */
   if (temp_external_heat_control != 0U)
   {
-    Temp_SetHeatOutput(on);
+    if ((on != 0U) && (temp_fault != 0U))
+    {
+      Temp_SetHeatOutput(0U);
+    }
+    else
+    {
+      Temp_SetHeatOutput(on);
+    }
   }
 }
 
@@ -130,6 +146,7 @@ void Temp_Control_TaskProcess(void)
   float current_temp;
   uint32_t now;
 
+  // 外部接管期间不执行本地回差控制逻辑，避免与上层状态机冲突。
   if (temp_external_heat_control != 0U)
   {
     return;
@@ -140,8 +157,21 @@ void Temp_Control_TaskProcess(void)
 
   if (temp_enabled == 0U)
   {
-    temp_preheat_drain_active = 0U;
-    temp_preheat_drain_start_tick = 0U;
+    temp_preheat_circulation_active = 0U;
+    temp_preheat_circulation_start_tick = 0U;
+    Temp_SetHeatOutput(0U);
+    return;
+  }
+
+  /* 传感器异常、超温或缺水时立即停热并锁存，防止后续周期命令自动恢复。 */
+  if ((Sensor_IsTempSensorOk() == 0U) ||
+      (current_temp >= TEMP_HIGH_CUTOFF_C) ||
+      (Sensor_GetWaterLevelProtocol() < SENSOR_WATER_MIN_SAFE_LITERS))
+  {
+    temp_fault = 1U;
+    temp_enabled = 0U;
+    temp_preheat_circulation_active = 0U;
+    temp_heat_start_tick = 0U;
     Temp_SetHeatOutput(0U);
     return;
   }
@@ -149,39 +179,41 @@ void Temp_Control_TaskProcess(void)
   /* 回差区内保持原输出，避免在阈值附近反复启停。 */
   if (current_temp <= (temp_target_c - TEMP_HYSTERESIS_LOW_C))
   {
-    if ((temp_heating == 0U) && (temp_preheat_drain_active == 0U))
+    /* 真正需要加热前先内循环 5 秒，让加热管充满水；期间保持 EN_HEAT 关闭。 */
+    if ((temp_heating == 0U) && (temp_preheat_circulation_active == 0U))
     {
-      /* 真正需要加热前先排空管道 5s，期间保持 EN_HEAT 关闭。 */
-      temp_preheat_drain_active = 1U;
-      temp_preheat_drain_start_tick = now;
+      temp_preheat_circulation_active = 1U;
+      temp_preheat_circulation_start_tick = now;
       Temp_SetHeatOutput(0U);
-      PumpValve_SetMode(PUMP_VALVE_MODE_DRAIN);
+      PumpValve_SetMode(PUMP_VALVE_MODE_CIRCULATION);
       return;
     }
 
-    if (temp_preheat_drain_active != 0U)
+    /* 预循环期间保持 EN_HEAT 关闭和排水阀关闭；满 5 秒后才允许加热。 */
+    if (temp_preheat_circulation_active != 0U)
     {
       Temp_SetHeatOutput(0U);
-      PumpValve_SetMode(PUMP_VALVE_MODE_DRAIN);
-      if ((now - temp_preheat_drain_start_tick) < TEMP_PREHEAT_DRAIN_MS)
+      PumpValve_SetMode(PUMP_VALVE_MODE_CIRCULATION);
+      if ((now - temp_preheat_circulation_start_tick) < TEMP_PREHEAT_CIRCULATION_MS)
       {
         return;
       }
-      temp_preheat_drain_active = 0U;
-      temp_preheat_drain_start_tick = 0U;
-      PumpValve_SetMode(PUMP_VALVE_MODE_CIRCULATION);
+      temp_preheat_circulation_active = 0U;
+      temp_preheat_circulation_start_tick = 0U;
     }
 
+    /* 低于下回差线且预循环完成后才允许加热，避免加热管无水空烧。 */
     if (temp_heating == 0U)
     {
       temp_heat_start_tick = now;
     }
     Temp_SetHeatOutput(1U);
   }
+  // 高于上回差线时立即停热，避免温度过冲。
   else if (current_temp >= (temp_target_c + TEMP_HYSTERESIS_HIGH_C))
   {
-    temp_preheat_drain_active = 0U;
-    temp_preheat_drain_start_tick = 0U;
+    temp_preheat_circulation_active = 0U;
+    temp_preheat_circulation_start_tick = 0U;
     Temp_SetHeatOutput(0U);
     temp_heat_start_tick = 0U;
   }

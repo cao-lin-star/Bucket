@@ -11,6 +11,10 @@
 #include "uart_comm.h"
 #include "uv_lamp.h"
 
+/*
+ * 任务周期沿用重构前配置：传感器/电机 20 ms，泵阀/通信/系统监控 50 ms，
+ * 温控 100 ms，UV 500 ms，日志 1000 ms。修改周期前需重新评估保护响应时间。
+ */
 void RtosTasks_Sensor(void *argument)
 {
   (void)argument;
@@ -86,6 +90,7 @@ void RtosTasks_SystemMonitor(void *argument)
   (void)argument;
   for (;;)
   {
+    /* 先刷新基站/充电状态，再生成本周期系统故障和状态快照。 */
     PowerManager_TaskProcess();
     SystemMonitor_TaskProcess();
     osDelay(50U);

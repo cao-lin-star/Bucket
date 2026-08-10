@@ -10,6 +10,10 @@
 #include "uart_comm.h"
 #include "uv_lamp.h"
 
+/*
+ * 初始化顺序是业务约束：先让传感器和执行器进入安全初态，再初始化监控、
+ * 电源和日志；UART DMA 最后启动，避免接收回调访问尚未初始化的模块状态。
+ */
 void BucketApp_Init(void)
 {
   Sensor_Init();
