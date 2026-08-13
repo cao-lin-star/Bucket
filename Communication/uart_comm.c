@@ -719,13 +719,15 @@ static uint8_t UART_Comm_IsBaseCirculationStatus(uint8_t status)
           (status == UART_BASE_STATUS_CLEAR_SPRAY)) ? 1U : 0U;
 }
 /* 基站退出水路动作后，仅在恒温和 UV 都不需要循环时关闭水泵。 */
-static void UART_Comm_SyncPumpValveFromBaseStatus(uint8_t status)
+static void UART_Comm_SyncPumpValveFromBaseStatus(uint8_t status,
+                                                  uint8_t circulation_requested)
 {
   if (UART_Comm_IsBaseDrainStatus(status) != 0U)
   {
     PumpValve_SetMode(PUMP_VALVE_MODE_DRAIN);
   }
-  else if (UART_Comm_IsBaseCirculationStatus(status) != 0U)
+  else if ((circulation_requested != 0U) ||
+           (UART_Comm_IsBaseCirculationStatus(status) != 0U))
   {
     PumpValve_SetMode(PUMP_VALVE_MODE_CIRCULATION);
   }
@@ -756,7 +758,7 @@ static uint8_t UART_Comm_ProcessBaseFrame(const uint8_t *frame)
   }
 
   memcpy(base_data, &frame[16], sizeof(base_data));
-  UART_Comm_SyncPumpValveFromBaseStatus(frame[23]);
+  UART_Comm_SyncPumpValveFromBaseStatus(frame[23], frame[28]);
   now = HAL_GetTick();
   base_last_rx_tick = now;
   return 1U;
