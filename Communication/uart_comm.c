@@ -44,6 +44,10 @@
 #define UART_COMM_BASE_DCIN_CONNECTED_DV 130U
 #endif
 
+/* 电池百分比上传范围，单位 0.1 V：18.5 V=0%，25.0 V=100%。 */
+#define UART_COMM_BATTERY_EMPTY_DV        185U
+#define UART_COMM_BATTERY_FULL_DV         250U
+
 /* 自动上水期间桶内循环泵允许启动的本地安全水量，单位 L。 */
 #ifndef UART_COMM_AUTO_FILL_CIRC_MIN_WATER_L
 #define UART_COMM_AUTO_FILL_CIRC_MIN_WATER_L 1.0f
@@ -1308,6 +1312,31 @@ static uint8_t UART_Comm_ProcessBaseFrame(const uint8_t *frame)
   UART_Comm_SyncPumpValveFromBaseStatus(frame[23], frame[28]);
   return 1U;
 }
+/*
+ * 将电池电压线性换算为协议百分比：
+ *   percent = round((battery_dv - 185) * 100 / (250 - 185))。
+ * 1~99% 使用压缩 BCD（例如 42%=0x42），满电 100% 使用特殊值 0xFF。
+ */
+static uint8_t UART_Comm_BatteryDecivoltToBcdPercent(uint16_t battery_dv)
+{
+  uint32_t percent;
+  uint32_t range;
+
+  if (battery_dv <= UART_COMM_BATTERY_EMPTY_DV)
+  {
+    return 0x00U;
+  }
+  if (battery_dv >= UART_COMM_BATTERY_FULL_DV)
+  {
+    return 0xFFU;
+  }
+
+  range = UART_COMM_BATTERY_FULL_DV - UART_COMM_BATTERY_EMPTY_DV;
+  percent = ((uint32_t)(battery_dv - UART_COMM_BATTERY_EMPTY_DV) * 100U +
+             (range / 2U)) / range;
+  return (uint8_t)(((percent / 10U) << 4U) | (percent % 10U));
+}
+
 /* 组装状态快照；基站离线时不带入上次缓存的基站数据。 */
 uint8_t UART_Comm_BuildStatusFrame(uint8_t *frame)
 {
@@ -1333,8 +1362,8 @@ uint8_t UART_Comm_BuildStatusFrame(uint8_t *frame)
   frame[9] = SystemMonitor_GetTimerRemainingMin();
 
   battery_dv = Sensor_GetBatteryDeciVolt();
-  frame[10] = (uint8_t)((battery_dv >> 8) & 0xFFU);
-  frame[11] = (uint8_t)(battery_dv & 0xFFU);
+  frame[10] = 0x00U;
+  frame[11] = UART_Comm_BatteryDecivoltToBcdPercent(battery_dv);
   frame[12] = SystemMonitor_GetMainStatus();
   frame[13] = SystemMonitor_GetSubStatus();
   frame[14] = SystemMonitor_GetErrCode1();

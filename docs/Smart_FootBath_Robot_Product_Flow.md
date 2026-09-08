@@ -1,4 +1,4 @@
-﻿# 智能足浴桶机器人产品与研发流程图
+# 智能足浴桶机器人产品与研发流程图
 
 > 适用范围：当前代码中的三端协同逻辑：桶体工程 `Foot_bath_robot_V1`、基站工程 `Foot_bath_robot_base_V2`、Linux 主控通信协议。
 >
@@ -163,7 +163,7 @@ flowchart TD
 | `data[7]` | 按摩电机档位 | `Motor_GetLevel()` |
 | `data[8]` | UV 状态 | `UV_IsOn()` |
 | `data[9]` | 定时剩余分钟 | `SystemMonitor_GetTimerRemainingMin()` |
-| `data[10..11]` | 电池电压 | 0.1V 单位，高低字节 |
+| `data[10..11]` | 电池百分比 | `data[10]=0x00`；`data[11]`中间百分比使用BCD，18.5V及以下=`0x00`，25.0V及以上=`0xFF` |
 | `data[12]` | 桶体主状态 | 见桶体状态表 |
 | `data[13]` | 桶体子状态 | 当前多用于定时剩余分钟或 0 |
 | `data[14]` | 桶体错误码 1 | 传感器/水位/温度类 |
