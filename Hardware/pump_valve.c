@@ -3,7 +3,8 @@
 #include "sensor.h"
 
 static PumpValveMode_t pump_mode;       //当前泵/阀模式 关/循环/排水
-static uint8_t pump_fault;              //泵故障标志 0=正常 1=故障
+static uint8_t pump_fault;              // 泵故障锁存标志：1=故障，0=正常
+static uint8_t pump_drain_allowed;       // 排水通信安全授权：1=允许，0=禁止
 static uint32_t pump_mode_start_tick;   //当前模式开始时间，用于排水模式超时检测
 
 //根据模式设置泵和阀的状态
@@ -37,6 +38,7 @@ void PumpValve_Init(void)
 {
   pump_mode = PUMP_VALVE_MODE_OFF;
   pump_fault = 0U;
+  pump_drain_allowed = 0U;
   pump_mode_start_tick = HAL_GetTick();
   PumpValve_Apply(PUMP_VALVE_MODE_OFF);
 }
@@ -48,6 +50,18 @@ void PumpValve_SetMode(PumpValveMode_t mode)
   if ((mode != PUMP_VALVE_MODE_OFF) &&
       (mode != PUMP_VALVE_MODE_CIRCULATION) &&
       (mode != PUMP_VALVE_MODE_DRAIN))
+  {
+    mode = PUMP_VALVE_MODE_OFF;
+  }
+
+  /* 循环必须有水；排水沿用独立通信门禁，允许正常排至空桶。 */
+  if ((mode == PUMP_VALVE_MODE_CIRCULATION) && (Sensor_IsWaterSafe() == 0U))
+  {
+    mode = PUMP_VALVE_MODE_OFF;
+  }
+
+  /* 通信层未确认两端在线时，底层直接拒绝进入排水模式。 */
+  if ((mode == PUMP_VALVE_MODE_DRAIN) && (pump_drain_allowed == 0U))
   {
     mode = PUMP_VALVE_MODE_OFF;
   }
@@ -66,6 +80,19 @@ void PumpValve_SetMode(PumpValveMode_t mode)
   PumpValve_Apply(mode);
 }
 
+
+/* 撤销排水授权时立即关闭正在运行的排水，不能等待下一个业务状态。 */
+void PumpValve_SetDrainAllowed(uint8_t allowed)
+{
+  pump_drain_allowed = (allowed != 0U) ? 1U : 0U;
+  if ((pump_drain_allowed == 0U) && (pump_mode == PUMP_VALVE_MODE_DRAIN))
+  {
+    pump_mode = PUMP_VALVE_MODE_OFF;
+    pump_mode_start_tick = HAL_GetTick();
+    PumpValve_Apply(PUMP_VALVE_MODE_OFF);
+  }
+}
+
 //获取当前泵/阀模式
 PumpValveMode_t PumpValve_GetMode(void)
 {
@@ -77,6 +104,13 @@ void PumpValve_TaskProcess(void)
 {
   /* 运行态周期检查泵电流；排水模式还需检查最长持续时间。 */
   uint16_t current_ma;
+
+  /* 运行中失水或水位传感器异常，立即停循环泵并关闭阀。 */
+  if ((pump_mode == PUMP_VALVE_MODE_CIRCULATION) && (Sensor_IsWaterSafe() == 0U))
+  {
+    PumpValve_SetMode(PUMP_VALVE_MODE_OFF);
+    return;
+  }
 
   current_ma = Sensor_GetPumpCurrentMa();
 

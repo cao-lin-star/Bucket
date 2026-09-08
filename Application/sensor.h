@@ -16,7 +16,10 @@ extern "C" {
  */
 /* 对外保留原有名称，通道总数由硬件采集层唯一维护。 */
 #define SENSOR_ADC_CHANNEL_COUNT        SENSOR_ACQUISITION_CHANNEL_COUNT
-#define SENSOR_WATER_MAX_LITERS         20U
+#ifndef SENSOR_WATER_MAX_LITERS
+/* 当前桶体的额定满水量；Flash 中的单机配置可覆盖此编译默认值。 */
+#define SENSOR_WATER_MAX_LITERS         12U
+#endif
 #define SENSOR_WATER_MIN_SAFE_LITERS    1U
 #define SENSOR_TEMP_INVALID_C           (-100.0f)
 
@@ -25,13 +28,27 @@ extern "C" {
 #endif
 
 #ifndef SENSOR_WATER_EMPTY_COUNT
-/* 水位标定值：频率越低表示水量越多，两端之间采用线性插值。 */
-#define SENSOR_WATER_EMPTY_COUNT        26700U
+/* 水位标定值：频率越低表示水量越多，两端之间采用分段曲线换算。 */
+#define SENSOR_WATER_EMPTY_COUNT        26400U
 #endif
 
 #ifndef SENSOR_WATER_FULL_COUNT
-/* 满桶时的水位标定值。 */
-#define SENSOR_WATER_FULL_COUNT         24700U
+/* 额定满桶（当前为 12 L）时的水位标定值。 */
+#define SENSOR_WATER_FULL_COUNT         25050U
+#endif
+
+#ifndef SENSOR_WATER_FIRST_LITER_WEIGHT
+/* 0 L 到 1 L 的计数变化权重，来源于实测约 250 个计数。 */
+#define SENSOR_WATER_FIRST_LITER_WEIGHT 250U
+#endif
+
+#ifndef SENSOR_WATER_LATER_LITER_WEIGHT
+/* 1 L 以后每增加 1 L 的计数变化权重，来源于实测约 100 个计数。 */
+#define SENSOR_WATER_LATER_LITER_WEIGHT 100U
+#endif
+
+#if ((SENSOR_WATER_FIRST_LITER_WEIGHT == 0U) || (SENSOR_WATER_LATER_LITER_WEIGHT == 0U))
+#error "Water level curve weights must be greater than zero"
 #endif
 
 #ifndef SENSOR_WATER_COUNT_WINDOW_MS
@@ -113,6 +130,8 @@ void Sensor_GetSnapshot(SensorSnapshot_t *snapshot);
 uint16_t Sensor_GetRaw(SensorAdcChannel_t channel);
 uint16_t Sensor_GetMilliVolt(SensorAdcChannel_t channel);
 float Sensor_GetWaterLiters(void);
+/** 任务上下文：同一快照内水位有效且实际水量 >= 安全阈值才返回 1。 */
+uint8_t Sensor_IsWaterSafe(void);
 uint8_t Sensor_GetWaterLevelProtocol(void);
 uint32_t Sensor_GetWaterFrequencyHz(void);
 float Sensor_GetTemperatureC(void);

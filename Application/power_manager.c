@@ -27,7 +27,13 @@ static void PowerManager_ResetChargeDelay(void)
 
 void PowerManager_Init(void)
 {
-  /* 上电默认禁止充电；仅当基站在线且低电条件稳定 10 s 后才允许充电。 */
+  /* 上电默认禁止充电；仅当两条通信链路在线且低电条件稳定 10 s 后才允许充电。 */
+  PowerManager_SetChargingEnabled(0U);
+  PowerManager_ResetChargeDelay();
+}
+
+void PowerManager_ForceOff(void)
+{
   PowerManager_SetChargingEnabled(0U);
   PowerManager_ResetChargeDelay();
 }
@@ -37,13 +43,16 @@ void PowerManager_TaskProcess(void)
 {
   uint16_t battery_dv;
   uint8_t base_connected;
+  uint8_t main_connected;
   uint32_t now;
 
-  battery_dv = Sensor_GetBatteryDeciVolt();           // 电池电压（分厘伏）
-  base_connected = UART_Comm_IsBaseConnected();       // 基站在线状态
+  battery_dv = Sensor_GetBatteryDeciVolt();           // 电池电压（单位 0.1 V）
+  base_connected = UART_Comm_IsBaseConnected();       // 基站双向在线状态
+  main_connected = UART_Comm_IsMainConnected();       // Linux 主控在线状态
 
-  // 充电条件：基站在线且电池电压低于启动阈值；高于停止阈值则立即禁止充电。
+  // 任一通信链路掉线或电压超过停止阈值，立即禁止充电。
   if ((base_connected == 0U) ||
+      (main_connected == 0U) ||
       (battery_dv > POWER_MANAGER_BAT_CHARGE_STOP_DV))
   {
     PowerManager_SetChargingEnabled(0U);

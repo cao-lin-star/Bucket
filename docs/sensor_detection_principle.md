@@ -5,6 +5,7 @@
 - `Core/Src/adc.c`：CubeMX 生成的 ADC1 和 DMA 基础配置。
 - `Hardware/sensor_acquisition.c/.h`：NTC 供电、ADC 校准与 DMA 启动、6 路 ADC 原始值滤波、TIM3 水位脉冲采集。
 - `Application/sensor.c/.h`：把滤波后的原始值换算为水量、温度、电压和电流，并维护 `SensorSnapshot_t`。
+- `Application/device_config.c/.h`：维护水位运行时配置，并通过双页 Flash 日志持久化。
 
 `Sensor_*` 公共接口保持不变，其他业务模块不直接访问 ADC、DMA 或 TIM3。
 
@@ -84,20 +85,62 @@ frequency_hz = round(pulse_count × 1000 / elapsed_ms)
 
 ### 5.2 频率转水量
 
-当前标定值：空桶 26700 Hz，满桶 24700 Hz，最大水量 20 L。频率越低表示水量越多：
+当前水位换算使用运行时配置，而不是在公式中直接读取固定宏。编译默认值为：
+
+- `water_0l_hz = 26400 Hz`：0 L 空桶端点；
+- `water_full_hz = 24400 Hz`：满量程端点，默认产品也可称为 `water_12l_hz`；
+- `water_max_l = 12 L`：满量程端点对应水量。
+
+频率越低表示水量越多。实测曲线不再按整段线性处理，而采用两个相对权重：
 
 ```text
-liters = (EMPTY_COUNT - frequency_hz) × MAX_LITERS
-         / (EMPTY_COUNT - FULL_COUNT)
+first_weight = 250    // 0 L 到 1 L
+later_weight = 100    // 1 L 以后每增加 1 L
 ```
 
-边界处理：
+为保留每台传感器分别保存的 0 L/full 端点，250:100 作为曲线形状权重，再按实际端点总跨度归一化：
 
-- `frequency_hz >= 26700`：0 L。
-- `frequency_hz <= 24700`：20 L。
-- 中间区间：线性插值，并限制在 0~20 L。
+```text
+count_span   = water_0l_hz - water_full_hz
+total_weight = 250 + (water_max_l - 1) × 100
+first_span   = count_span × 250 / total_weight
+later_span   = count_span × 100 / total_weight
+```
 
-通信协议值由 `round(water_liters)` 得到整数升，再限制到 20 L。
+令 `count_drop = water_0l_hz - frequency_hz`，分段换算为：
+
+```text
+count_drop <= first_span：liters = count_drop / first_span
+count_drop >  first_span：liters = 1 + (count_drop - first_span) / later_span
+```
+
+边界处理也使用当前活动配置：
+
+- `frequency_hz >= water_0l_hz`：输出 0 L；
+- `frequency_hz <= water_full_hz`：输出 `water_max_l`；
+- 中间区间：先按 250 权重计算第 1 L，再按每升 100 权重计算剩余水量；
+- 当满量程配置为 1 L 时，整个端点跨度直接线性映射到 0~1 L。
+
+默认端点 26400/24400 Hz 的总跨度为 2000 Hz。归一化后，第 1 L 实际占约 370.37 Hz，后续每升约 148.15 Hz，1 L 分界约为 26029.63 Hz；250/100 表示相对曲线比例，不是这组端点下的绝对 Hz 差。
+
+通信协议值由 `round(water_liters)` 得到整数升，再限制到当前 `water_max_l`。编译默认协议范围为 `0..12 L`。
+
+`water_12l_hz` 是默认 12 L 产品的控制台名称，`water_full_hz` 是其等价别名。如果把 `water_max_l` 改为其他值，端点的实际含义随之变为该满量程水量，不再必然代表 12 L。
+
+### 5.3 运行时标定和校验
+
+通过日志串口输入 `config` 可暂停每秒状态日志并显示活动端点、宏默认值、来源、dirty 和 sequence。使用以下命令调整：
+
+```text
+set water_0l_hz N
+set water_12l_hz N
+set water_full_hz N
+set water_max_l N
+```
+
+`set` 只更新 RAM，成功后立即参与换算；只有 `save` 才持久化到 Flash。`defaults` 只把 RAM 恢复为宏默认值，`reload` 放弃未保存修改并重新读取 Flash。
+
+合法范围为：端点频率 `1000..40000 Hz`，0 L 频率必须高于满量程频率，跨度至少 `100 Hz`，最大水量 `1..20 L`。`save` 仅允许在加热、泵阀、电机和 UV 全部关闭时执行。
 
 ## 6. NTC 温度
 
@@ -202,5 +245,17 @@ motor_current_ma = round(adc_mv × 1000 / 150)
 1. 用万用表测量 VDDA，必要时调整 `SENSOR_ADC_VREF_MV`。
 2. 用已知 DCIN 和电池电压核对 `SENSOR_DCIN_DIVIDER_X100`、`SENSOR_BAT_DIVIDER_X100`。
 3. 用已知电流校准两路电流采样参数，并同时考虑运放或滤波网络增益。
-4. 分别记录实际空桶和满桶的稳定脉冲频率，再调整 `SENSOR_WATER_EMPTY_COUNT`、`SENSOR_WATER_FULL_COUNT`。
+4. 分别记录实际空桶和目标满量程的稳定频率，通过配置控制台 `set` 后验证水量；确认无误再执行 `save`。宏只提供 26400 Hz、24400 Hz 和 12 L 的编译默认值。
 5. 用标准温度计核对 NTC 的 R0、B 值和上拉电阻，避免仅凭器件名称设置参数。
+
+## 12. 运行时配置边界
+
+当前控制台只开放水位两端频率和满量程水量。以下参数会在 `config` 输出中列为未来项目，但目前只能读取编译值，不能通过控制台修改：
+
+- 水位 250:100 分段曲线权重、统计窗口、IIR 滤波和无脉冲超时；
+- ADC 参考电压、电池/DCIN 分压和水泵/电机电流标定；
+- 恒温目标、回差、充电阈值及各类保护阈值。
+
+持久化配置采用 Flash 双页日志、CRC、递增序号和最后写入的提交标志。掉电导致的新记录不完整时会回退到前一条有效记录；固件整片擦除会清除两页配置并恢复宏默认值。
+
+基站现有自动上水协议按 `0..12 L` 设计。若桶体把 `water_max_l` 设置为大于 12 L，必须同步升级基站的目标水位校验、完成判断和界面，否则两端会对同一水位产生不同业务解释。完整命令说明见 `docs/Logging_Output.md`。

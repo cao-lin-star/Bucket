@@ -210,7 +210,7 @@ void SystemMonitor_ClearErrors(void)
 void SystemMonitor_TaskProcess(void)
 {
   uint16_t battery_dv;      //电池电压（分厘伏）
-  uint8_t water_level;      //水位（协议值）
+
   uint8_t active_needs_water;     //当前活动是否需要水（加热/循环/UV）
 
   //每次调用先清除之前的错误码，再根据当前传感器状态和执行部件状态重新计算错误码
@@ -218,15 +218,16 @@ void SystemMonitor_TaskProcess(void)
   system_err2 = 0U;
 
   //读取当前水位和活动状态
-  water_level = Sensor_GetWaterLevelProtocol();
+
 
   //判断当前是否有需要水的活动正在运行（加热/循环/UV），如果有但水位过低则报缺水故障
   active_needs_water = ((Temp_IsEnabled() != 0U) ||
                         (PumpValve_GetMode() == PUMP_VALVE_MODE_CIRCULATION) ||
-                        (UV_IsOn() != 0U)) ? 1U : 0U;
+                        (UV_IsOn() != 0U) ||
+                        (Motor_IsRunning() != 0U)) ? 1U : 0U;
   // ==================== 错误检测1：传感器与安全保护 ====================
   // 1. 缺水保护：运行中但水位过低 → 报缺水故障
-  if ((active_needs_water != 0U) && (water_level < SENSOR_WATER_MIN_SAFE_LITERS))
+  if ((active_needs_water != 0U) && (Sensor_IsWaterSafe() == 0U))
   {
     system_err1 |= BUCKET_ERR1_LACK_WATER;
   }

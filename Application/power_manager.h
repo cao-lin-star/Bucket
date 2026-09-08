@@ -13,16 +13,18 @@ extern "C" {
 #endif
 
 #ifndef POWER_MANAGER_BAT_CHARGE_START_DV
-/* Start charging only when battery is below 24.0V and base is connected. Unit: 0.1V. */
+/* Linux 与基站均在线且电池低于 24.0 V 时才进入充电延时。单位：0.1 V。 */
 #define POWER_MANAGER_BAT_CHARGE_START_DV     240U
 #endif
 
 #ifndef POWER_MANAGER_CHARGE_START_DELAY_MS
-/* Base-connected and low-battery condition must remain valid for 10s before charging starts. */
+/* 双链路在线且低电条件连续保持 10 s 后才开启充电。 */
 #define POWER_MANAGER_CHARGE_START_DELAY_MS   10000UL
 #endif
 
 void PowerManager_Init(void);
+/** 通信安全路径立即关闭充电并清除启动延时。 */
+void PowerManager_ForceOff(void);
 void PowerManager_TaskProcess(void);
 uint8_t PowerManager_IsChargingEnabled(void);
 

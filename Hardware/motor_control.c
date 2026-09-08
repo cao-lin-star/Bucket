@@ -55,6 +55,14 @@ static void Motor_SetTimerChannel(TIM_HandleTypeDef *htim, uint32_t channel, uin
 
 static void Motor_ApplyPwm(uint8_t duty_percent, MotorDirection_t direction)
 {
+  /* 输出前再次检查，防止任务切换后继续使用旧的运行状态输出 PWM。 */
+  if ((duty_percent != 0U) && (Sensor_IsWaterSafe() == 0U))
+  {
+    duty_percent = 0U;
+    motor_level = 0U;
+    motor_manual_duty = 0U;
+    motor_running = 0U;
+  }
   /* H 桥两侧只允许一侧输出 PWM，另一侧保持关闭，避免直通。 */
 #if MOTOR_USE_TIM4_PWM
   if (direction == MOTOR_DIR_FORWARD)
@@ -116,7 +124,7 @@ void Motor_Init(void)
 void Motor_Run(uint8_t speed, uint8_t direction)
 {
   /* 故障未清除时保持停机，防止重复命令绕过过流锁存。 */
-  if ((motor_fault != 0U) && (speed != 0U))
+  if ((speed != 0U) && ((motor_fault != 0U) || (Sensor_IsWaterSafe() == 0U)))
   {
     Motor_Stop();
     return;
@@ -157,7 +165,7 @@ void Motor_SetLevel(uint8_t level)
   }
 
   /* 协议档位命令同样受故障锁存约束；0 档始终允许用于停机。 */
-  if ((motor_fault != 0U) && (level != 0U))
+  if ((level != 0U) && ((motor_fault != 0U) || (Sensor_IsWaterSafe() == 0U)))
   {
     Motor_Stop();
     return;
@@ -238,6 +246,12 @@ void Motor_TaskProcess(void)
   uint16_t current_ma;
   uint8_t duty;
 
+  /* 失水时取消档位和手动占空比，补水不会自动恢复按摩。 */
+  if ((motor_running != 0U) && (Sensor_IsWaterSafe() == 0U))
+  {
+    Motor_Stop();
+    return;
+  }
   now = HAL_GetTick();
   // ===================== 1. 自动换向逻辑 =====================
   // 如果电机运行中 && 自动反转开启 && 到达换向时间

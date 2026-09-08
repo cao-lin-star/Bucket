@@ -17,7 +17,7 @@ void UV_Init(void)
 void UV_On(void)
 {
   /* 故障锁存时禁止点亮，必须先由上层显式清除故障。 */
-  if (uv_fault != 0U)
+  if ((uv_fault != 0U) || (Sensor_IsWaterSafe() == 0U))
   {
     UV_Off();
     return;
@@ -69,7 +69,7 @@ void UV_ClearFault(void)
 void UV_TaskProcess(void)
 {
   /* UV 运行中缺水时立即关闭并锁存故障，避免周期命令重新点亮。 */
-  if ((uv_enabled != 0U) && (Sensor_GetWaterLevelProtocol() < SENSOR_WATER_MIN_SAFE_LITERS))
+  if ((uv_enabled != 0U) && (Sensor_IsWaterSafe() == 0U))
   {
     uv_fault = 1U;
     UV_Off();

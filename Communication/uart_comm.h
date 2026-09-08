@@ -39,6 +39,10 @@ uint8_t UART_Comm_BuildStatusFrame(uint8_t *frame);
 uint8_t UART_Comm_IsFrameValid(const uint8_t *frame);
 uint8_t UART_Comm_Checksum(const uint8_t *frame);
 uint8_t UART_Comm_IsBaseConnected(void);
+/** 返回 Linux 主控是否在 5 秒窗口内持续发送合法帧。 */
+uint8_t UART_Comm_IsMainConnected(void);
+/** 每秒日志调用：输出对接诊断，不改变通信状态。 */
+void UART_Comm_LogDockStatus(void);
 
 #ifdef __cplusplus
 }

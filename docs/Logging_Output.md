@@ -4,8 +4,9 @@
 
 ## 1. 输出通道与频率
 
-- 默认日志端口为 `USART3`，波特率为 `115200`；当 `UART_PORT_DEBUG_SWAP_LOG_LINUX` 配置为非 0 时，日志端口切换为 `USART1`。端口选择和波特率见 `Communication/uart_port_config.h`。
-- `Logging_TaskProcess()` 由日志任务每 `1000 ms` 调用一次，因此正常情况下每秒输出一行状态日志。
+- 默认日志端口为 `USART3`，波特率为 `115200`。当前硬件工程未给 USART3 配置 Linux 协议所需的 RX DMA，因此应保持 `UART_PORT_DEBUG_SWAP_LOG_LINUX=0`；若以后补齐 USART3 RX DMA，日志口才可安全切换到 USART1。端口选择和波特率见 `Communication/uart_port_config.h`。
+- 日志任务每 `50 ms` 处理一次文本命令；`Logging_TaskProcess()` 在内部按 Tick 限流，因此正常状态行仍每 `1000 ms` 输出一次。
+- 日志串口同时提供文本配置控制台。发送一行 `config` 会暂停每秒状态日志并显示当前水位标定；发送 `log` 恢复周期日志。
 - 日志使用 UART DMA 和环形缓冲区异步发送，不应将其作为严格实时的时间基准；串口拥塞时日志可能延后或丢弃。
 - 初始化成功后会先输出一行：`LOG is ready`。
 
@@ -14,7 +15,7 @@
 默认编译配置为 `LOGGING_ENABLE_CURRENT_DEBUG = 1U`、`LOGGING_ENABLE_WATER_COUNT_DEBUG = 1U`，实际格式如下：
 
 ```text
-[BUCKET] T:+38.5C BAT_NTC:+31.2C  W:12L  WC:25500Hz  BAT:24.3V DCIN:26.1V BASE:1 CHG:1 | ADC MOT:380mV PUMP:120mV | OUT M:2 P:1 H:1 UV:0 | ST:4/10 TS:600s CMD:A2 | I MOT:2533mA PUMP:40mA | ERR:00/00
+[BUCKET] T:+38.5C BAT_NTC:+31.2C  W:12L  WC:24400Hz  BAT:24.3V DCIN:26.1V BASE:1 CHG:1 | ADC MOT:380mV PUMP:120mV | OUT M:2 P:1 H:1 UV:0 | ST:4/10 TS:600s CMD:A2 | I MOT:2533mA PUMP:40mA | ERR:00/00
 ```
 
 各字段以 `|` 分为传感器、电源、ADC、输出、系统状态、电流和故障七组。
@@ -25,12 +26,12 @@
 | --- | --- | --- |
 | `T` | 桶内 NTC 温度 | `℃`；显示为 `-100.0C` 表示温度传感器无效。 |
 | `BAT_NTC` | 电池 NTC 温度 | `℃`；显示为 `-100.0C` 表示电池温度传感器无效。 |
-| `W` | 通信协议水位 | `L`，整数升，范围 0~20。 |
+| `W` | 通信协议水位 | `L`，整数升，范围 0～当前 `water_max_l`；编译默认范围为 0～12。 |
 | `WC` | 水位传感器滤波后的脉冲频率 | `Hz`；仅在水位频率调试开关开启时打印。 |
 | `BAT` | 电池实际电压 | `V`，由 `battery_decivolt` 的 0.1 V 值格式化得到。 |
 | `DCIN` | 基站/DCIN 输入实际电压 | `V`，由 `dcin_decivolt` 的 0.1 V 值格式化得到。 |
-| `BASE` | 基站在线状态 | `1`：DCIN 高于 13.0 V，且最近 3 秒收到合法基站帧；`0`：其余情况。 |
-| `CHG` | 充电使能状态 | `1`：`DCIN_ON` 已允许充电；`0`：禁止充电。 |
+| `BASE` | 基站在线状态 | `1`：DCIN 高于 13.0 V、3 秒内收到合法帧、基站 `frame[4]=1` 且重连安全停机已确认；`0`：其余情况。 |
+| `CHG` | 充电使能状态 | `1`：Linux/基站均在线，电池低于 24.0 V 的条件保持 10 秒后 `DCIN_ON` 已开启；任一链路掉线或电池高于 25.0 V 时立即为 `0`。 |
 | `ADC MOT` | 电机电流采样通道的 ADC 引脚电压 | `mV`，不是电机电流。 |
 | `ADC PUMP` | 水泵电流采样通道的 ADC 引脚电压 | `mV`，不是水泵电流。 |
 | `OUT M` | 按摩电机档位 | `0`：停止；`1`、`2`、`3`：对应按摩档位。 |
@@ -114,7 +115,132 @@
 ## 7. 代码对应关系
 
 - 状态行生成：`Application/log.c` 的 `Logging_TaskProcess()`。
+- 文本命令解析：`Application/config_console.c`。
+- 水位配置校验与 Flash 双页存储：`Application/device_config.c/.h`。
 - 日志任务周期：`RTOS/rtos_tasks.c` 的 `RtosTasks_Logging()`。
 - 传感器和电源字段：`Application/sensor.c`、`Application/power_manager.c`。
 - 基站在线判断和命令码：`Communication/uart_comm.c`。
 - 主状态、定时和错误码：`Application/system_monitor.c/.h`。
+
+## 8. 水位标定配置控制台
+
+### 8.1 进入、查看和退出
+
+使用默认配置时，将串口工具连接到 `USART3`，波特率设为 `115200`。命令使用可打印 ASCII 字符，并以回车或换行结束。
+
+输入 `config` 后，控制台暂停正常的每秒状态日志，并显示类似内容：
+
+```text
+[CFG] active 0L=26400Hz full=24400Hz max_l=12L (water_12l_hz=water_full_hz)
+[CFG] measure water=24400Hz sensor_ok=1
+[CFG] source=defaults dirty=1 seq=0; compile defaults 0L=26400Hz full=24400Hz max_l=12L
+[CFG] future(unavailable): water curve/filter/timeout; ADC voltage/current calibration; temperature/charge/protection thresholds
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `active` | 当前参与水位换算的 RAM 参数；`set` 成功后立即变化。 |
+| `0L` | 空桶标定频率，即 `water_0l_hz`。 |
+| `full` | 满量程端点频率；可用命令名 `water_12l_hz` 或别名 `water_full_hz`。 |
+| `max_l` | 满量程端点对应的水量，编译默认值为 12 L。 |
+| `source` | `flash` 表示当前活动参数来自有效 Flash 记录；`defaults` 表示当前活动参数等于编译宏默认值；`ram` 表示执行 `set` 后存在未保存的非默认 RAM 参数。是否需要保存以 `dirty` 为准。 |
+| `dirty` | `1` 表示 RAM 参数尚未持久化；`0` 表示与最近一次成功保存的 Flash 参数一致。 |
+| `seq` / `sequence` | 最近一条有效 Flash 配置记录的递增序号；从未成功保存时为 0。 |
+| `compile defaults` | 固件宏默认值：0 L 为 26400 Hz、满量程为 24400 Hz、最大水量为 12 L。 |
+
+`show` 重新显示当前配置，但不改变周期日志开关；`log` 恢复每秒状态日志。
+
+### 8.2 命令列表
+
+| 命令 | 作用 | 是否写 Flash |
+| --- | --- | --- |
+| `config` | 暂停周期日志，显示活动参数、来源、dirty、sequence、宏默认值及未来参数提示。 | 否 |
+| `show` | 显示当前活动参数及保存状态。 | 否 |
+| `set water_0l_hz N` | 设置 0 L 端点频率，单位 Hz。 | 否，只修改 RAM |
+| `set water_12l_hz N` | 设置满量程端点频率，单位 Hz；默认产品满量程为 12 L。 | 否，只修改 RAM |
+| `set water_full_hz N` | `water_12l_hz` 的等价别名。 | 否，只修改 RAM |
+| `set water_max_l N` | 设置满量程端点对应的整数升数。 | 否，只修改 RAM |
+| `save` | 将当前合法 RAM 参数持久化到 Flash。 | 是 |
+| `defaults` | 将 RAM 恢复为编译默认值并置 `dirty=1`，不会自动保存。 | 否 |
+| `reload` | 放弃未保存修改并重新扫描 Flash；无有效记录时装载编译默认值。 | 否 |
+| `log` | 恢复每秒状态日志。 | 否 |
+| `help` | 打印命令摘要和 `water_full_hz` 别名提示。 | 否 |
+
+示例：
+
+```text
+config
+set water_0l_hz 26420
+set water_12l_hz 24410
+set water_max_l 12
+show
+save
+log
+```
+
+`set` 成功后新值立即参与水位计算，但只存在于 RAM；复位或掉电后会丢失。只有 `save` 成功才会更新 Flash 和 `sequence`。建议先 `set`，观察 `WC` 与实际水量，再执行 `save`。
+
+水位曲线使用编译期权重：0~1 L 为 250，1 L 以后每升为 100。250:100 会按当前设备的 0 L/full 端点总跨度归一化，因此两个 Flash 标定端点仍精确成立；这两个曲线权重目前不能通过控制台修改。
+
+### 8.3 校验与安全保存条件
+
+每次 `set` 和 `save` 都会校验整组参数：
+
+- 两个端点频率都必须在 `1000..40000 Hz`。
+- `water_0l_hz` 必须大于满量程端点频率。
+- 两个端点的频率跨度必须至少为 `100 Hz`。
+- `water_max_l` 必须在 `1..20 L`。
+- 命令参数只接受无符号十进制整数。
+
+`save` 只允许在加热、水泵/排水阀、按摩电机和 UV 全部关闭时执行。安全检查和 Flash 擦写处于同一个调度器锁内，期间暂停任务切换但不关闭外设中断，避免检查后被其他任务重新开启输出。任一输出仍在运行时，控制台返回 `ERR save unsafe`；RAM 中尚未保存的参数保持不变。
+
+### 8.4 Flash 掉电保护
+
+配置使用两个独立 Flash 页追加保存。每条记录包含版本、长度、递增序号、提交标志和 CRC；提交标志最后写入。启动及 `reload` 只接受结构、提交标志和 CRC 全部有效的记录，并从双页中选择最新序号。
+
+写入期间掉电时，未完整提交的新记录会被忽略，系统回退到前一条有效记录。页写满后才轮换并擦除另一页，避免先破坏当前唯一有效配置。
+
+执行固件整片擦除（full-chip erase）会同时清除配置。设备下次启动将使用宏默认值，并显示 `source=defaults`、`dirty=1`。生产烧录或升级如需保留现场标定，必须避免擦除配置页，或升级后重新标定并执行 `save`。
+
+### 8.5 与基站协议的限制
+
+桶体编译默认最大水量为 12 L，基站现有自动上水协议和业务校验也按 `0..12 L` 设计。控制台虽允许把 `water_max_l` 设置到 20 L，但若设置为大于 12 L，必须同步升级基站的目标水位范围、完成判断和相关界面；只修改桶体会导致两端业务含义不一致。
+
+### 8.6 未来可开放但当前只读的参数
+
+`config` 当前只显示以下类别，尚不能通过控制台修改：
+
+- 水位 250:100 分段曲线权重、统计窗口、IIR 滤波和无脉冲超时；
+- ADC 参考电压、电池/DCIN 分压及水泵/电机电流标定；
+- 恒温目标范围、回差和加热保护阈值；
+- 充电启停阈值与延时；
+- 缺水、过流和排水超时等保护阈值。
+
+这些参数涉及采样稳定性或安全保护，后续开放时必须增加独立范围校验和不可越过的硬安全上限。
+
+## 对接诊断行 [DOCK]
+
+正常日志模式每秒在 [BUCKET] 后追加一行，不需要额外命令。config 模式沿用原有暂停周期日志规则。
+
+示例：
+~~~text
+[DOCK] ON:0 DC:24.5V PWR:1 LNX:1 LA:20ms RX:15 RA:30ms VA:30ms ACK:1 B1WAIT:1 LAST:02/00/01/03
+~~~
+
+| 字段 | 含义 |
+|---|---|
+| ON | 桶体判定的基站在线结果，与 BASE 相同含义 |
+| DC / PWR | 桶体采样 DCIN 电压；PWR=1 表示大于 13.0 V |
+| LNX / LA | Linux 在线结果 / 距最近合法 Linux 帧的毫秒数 |
+| RX | 自通信初始化后，在任务中处理的校验正确基站帧数量；包含模式不为 02 的帧，不是 UART 原始字节计数 |
+| RA | 距最近一帧上述校验正确基站数据的毫秒数 |
+| VA | 距最近接受的 02 模式基站帧的毫秒数，必须小于 3000 |
+| ACK | 最近接受的基站帧 data[4] 转换为 0/1，1 表示基站确认收到桶体数据 |
+| B1WAIT | 1 表示尚未确认安全 B1 待机，阻止在线；0 表示确认已完成 |
+| LAST | 最近校验正确基站帧的 data[2]/data[3]/data[4]/data[23]，十六进制 |
+
+年龄 -1 表示尚未收到对应数据。LAST 在 RX=0 时没有有效含义。正常完成 B1 确认时可见 LAST:02/B1/01/03；示例 LAST:02/00/01/03 表示虽然基站待机，但未回显 B1。
+
+排查顺序：PWR=0 查 DCIN；RX 不增加查接线、端口和校验；RA 更新但 VA=-1 或超时查 LAST 第一个字节；ACK=0 查桶体到基站方向；B1WAIT=1 查 LAST 的 B1/03 以及 Base 固件版本；LNX=0 查 Linux 心跳。看到双方 TX 波形不能证明 RX 正确接收。
+
+诊断只读取状态，不发送命令、不改变安全判定。行内任务共享状态在短调度保护内复制，恢复调度后才打印。

@@ -32,6 +32,13 @@ static void Temp_SetHeatOutput(uint8_t on)
 {
   GPIO_PinState state;
 
+  /* 最终输出门禁同时覆盖本地恒温和外部接管接口。 */
+  if ((on != 0U) && (Sensor_IsWaterSafe() == 0U))
+  {
+    on = 0U;
+    temp_enabled = 0U;
+    temp_preheat_circulation_active = 0U;
+  }
   /* EN_HEAT 高有效，并同步软件状态以供监控和协议上报。 */
   state = (on != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET;
   HAL_GPIO_WritePin(EN_HEAT_GPIO_Port, EN_HEAT_Pin, state);
@@ -74,9 +81,12 @@ float Temp_Read(void)
 void Temp_Enable(uint8_t enable)
 {
   /* 锁存故障必须由 SystemMonitor_ClearErrors() 显式清除，周期命令不能重启加热。 */
-  if ((enable != 0U) && (temp_fault != 0U))
+  if ((enable != 0U) && ((temp_fault != 0U) || (Sensor_IsWaterSafe() == 0U)))
   {
     temp_enabled = 0U;
+    temp_preheat_circulation_active = 0U;
+    temp_preheat_circulation_start_tick = 0U;
+    temp_heat_start_tick = 0U;
     Temp_SetHeatOutput(0U);
     return;
   }
@@ -146,6 +156,23 @@ void Temp_Control_TaskProcess(void)
   float current_temp;
   uint32_t now;
 
+  /* 水位保护优先于外部接管；失水关闭加热和内循环，保留排水模式。 */
+  if (((temp_enabled != 0U) || (temp_heating != 0U)) &&
+      (Sensor_IsWaterSafe() == 0U))
+  {
+    temp_fault = 1U;
+    temp_enabled = 0U;
+    temp_preheat_circulation_active = 0U;
+    temp_preheat_circulation_start_tick = 0U;
+    temp_heat_start_tick = 0U;
+    Temp_SetHeatOutput(0U);
+    if (PumpValve_GetMode() == PUMP_VALVE_MODE_CIRCULATION)
+    {
+      PumpValve_SetMode(PUMP_VALVE_MODE_OFF);
+    }
+    return;
+  }
+
   // 外部接管期间不执行本地回差控制逻辑，避免与上层状态机冲突。
   if (temp_external_heat_control != 0U)
   {
@@ -166,7 +193,7 @@ void Temp_Control_TaskProcess(void)
   /* 传感器异常、超温或缺水时立即停热并锁存，防止后续周期命令自动恢复。 */
   if ((Sensor_IsTempSensorOk() == 0U) ||
       (current_temp >= TEMP_HIGH_CUTOFF_C) ||
-      (Sensor_GetWaterLevelProtocol() < SENSOR_WATER_MIN_SAFE_LITERS))
+      (Sensor_IsWaterSafe() == 0U))
   {
     temp_fault = 1U;
     temp_enabled = 0U;

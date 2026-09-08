@@ -1,4 +1,6 @@
 #include "app_bucket.h"
+#include "config_console.h"
+#include "device_config.h"
 
 #include "log.h"
 #include "motor_control.h"
@@ -16,6 +18,7 @@
  */
 void BucketApp_Init(void)
 {
+  DeviceConfig_Init();
   Sensor_Init();
   Temp_Init();
   Motor_Init();
@@ -25,5 +28,6 @@ void BucketApp_Init(void)
   PowerManager_Init();
   Logging_Init();
   UART_Comm_Init();
+  ConfigConsole_Init();
 }
 

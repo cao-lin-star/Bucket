@@ -22,6 +22,7 @@
 #include "stm32f1xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "config_console.h"
 #include "log.h"
 #include "uart_comm.h"
 /* USER CODE END Includes */
@@ -344,6 +345,7 @@ void USART3_IRQHandler(void)
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
   UART_Comm_RxEventCallback(huart, Size);
+  ConfigConsole_RxEventCallback(huart, Size);
 }
 
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
@@ -356,6 +358,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
   UART_Comm_ErrorCallback(huart);
   Logging_ErrorCallback(huart);
+  ConfigConsole_ErrorCallback(huart);
 }
 
 /* USER CODE END 1 */

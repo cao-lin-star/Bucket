@@ -1,4 +1,5 @@
 #include "sensor.h"
+#include "device_config.h"
 #include "sensor_acquisition.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -66,29 +67,69 @@ static float Sensor_ClampFloat(float value, float min_value, float max_value)
 
 /*
  * 功能：将水位传感器脉冲频率换算为桶内水量，单位 L。
- * 公式：liters = (EMPTY_COUNT - frequency) * MAX_LITERS /
- *                 (EMPTY_COUNT - FULL_COUNT)。
- * 频率 >= EMPTY_COUNT 时输出 0 L；频率 <= FULL_COUNT 时输出最大水量。
+ * 曲线规律：0~1 L 的计数变化权重为 250；1 L 以后每升权重为 100。
+ * 为保留每台传感器的 0 L/full 两端标定，250:100 作为相对权重，
+ * 再按实际端点总跨度等比例缩放，而不是把 250/100 当成固定绝对频差。
+ * total_weight = first_weight + (max_liters - 1) * later_weight；
+ * first_span = count_span * first_weight / total_weight；
+ * later_span = count_span * later_weight / total_weight。
+ * 三个标定参数来自当前设备配置：启动时优先读取 Flash，无有效记录时使用宏默认值。
+ * 频率 >= empty_hz 时输出 0 L；频率 <= full_hz 时输出最大水量。
  */
 static float Sensor_CalcWaterLiters(uint32_t count_per_second)
 {
+  DeviceConfig_t config;
+  float count_drop;
+  float count_span;
+  float first_liter_span;
+  float later_liter_span;
   float liters;
+  float total_weight;
+
+  /* 一次换算只使用同一份配置快照，避免串口改参时混用新旧端点。 */
+  DeviceConfig_GetSnapshot(&config);
 
   /* 标定特性反向：空桶频率高，满桶频率低；区间外直接饱和。 */
-  if (count_per_second >= SENSOR_WATER_EMPTY_COUNT)
+  if (count_per_second >= config.water_empty_frequency_hz)
   {
     return 0.0f;
   }
-  if (count_per_second <= SENSOR_WATER_FULL_COUNT)
+  if (count_per_second <= config.water_full_frequency_hz)
   {
-    return (float)SENSOR_WATER_MAX_LITERS;
+    return (float)config.water_max_liters;
   }
 
-  liters = ((float)(SENSOR_WATER_EMPTY_COUNT - count_per_second) *
-            (float)SENSOR_WATER_MAX_LITERS) /
-           (float)(SENSOR_WATER_EMPTY_COUNT - SENSOR_WATER_FULL_COUNT);
+  count_drop = (float)(config.water_empty_frequency_hz - count_per_second);
+  count_span = (float)(config.water_empty_frequency_hz -
+                       config.water_full_frequency_hz);
 
-  return Sensor_ClampFloat(liters, 0.0f, (float)SENSOR_WATER_MAX_LITERS);
+  /* 满量程为 1 L 时没有后续分段，整个端点跨度直接映射到 0~1 L。 */
+  if (config.water_max_liters <= 1U)
+  {
+    liters = count_drop / count_span;
+    return Sensor_ClampFloat(liters, 0.0f, 1.0f);
+  }
+
+  total_weight = (float)SENSOR_WATER_FIRST_LITER_WEIGHT +
+                 ((float)(config.water_max_liters - 1U) *
+                  (float)SENSOR_WATER_LATER_LITER_WEIGHT);
+  first_liter_span = count_span * (float)SENSOR_WATER_FIRST_LITER_WEIGHT /
+                     total_weight;
+
+  if (count_drop <= first_liter_span)
+  {
+    /* 0~1 L：第 1 L 使用较大的 250 权重，反映初次进水时的跳变。 */
+    liters = count_drop / first_liter_span;
+  }
+  else
+  {
+    /* 1 L 以后：每升使用相同的 100 权重，直到满量程端点。 */
+    later_liter_span = count_span * (float)SENSOR_WATER_LATER_LITER_WEIGHT /
+                       total_weight;
+    liters = 1.0f + ((count_drop - first_liter_span) / later_liter_span);
+  }
+
+  return Sensor_ClampFloat(liters, 0.0f, (float)config.water_max_liters);
 }
 
 /*
@@ -431,6 +472,15 @@ uint16_t Sensor_GetMilliVolt(SensorAdcChannel_t channel)
   return sensor_snapshot.millivolt[channel];
 }
 
+/* 四项用水功能共用实际升数门槛，不使用取整后的协议水位。 */
+uint8_t Sensor_IsWaterSafe(void)
+{
+  SensorSnapshot_t snapshot;
+  Sensor_GetSnapshot(&snapshot);
+  return ((snapshot.water_sensor_ok != 0U) &&
+          (snapshot.water_liters >= (float)SENSOR_WATER_MIN_SAFE_LITERS)) ? 1U : 0U;
+}
+
 float Sensor_GetWaterLiters(void)
 {
   return sensor_snapshot.water_liters;
@@ -442,13 +492,15 @@ float Sensor_GetWaterLiters(void)
  */
 uint8_t Sensor_GetWaterLevelProtocol(void)
 {
+  DeviceConfig_t config;
   uint8_t liters;
 
+  DeviceConfig_GetSnapshot(&config);
   /* 协议只传整数升，因此四舍五入并限制到允许的最大水量。 */
   liters = (uint8_t)(sensor_snapshot.water_liters + 0.5f);
-  if (liters > SENSOR_WATER_MAX_LITERS)
+  if (liters > config.water_max_liters)
   {
-    liters = SENSOR_WATER_MAX_LITERS;
+    liters = (uint8_t)config.water_max_liters;
   }
   return liters;
 }

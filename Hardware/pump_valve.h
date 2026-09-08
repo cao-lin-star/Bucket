@@ -32,6 +32,8 @@ typedef enum
 void PumpValve_Init(void);
 /** 原子切换水路模式；非法枚举值按关闭处理。 */
 void PumpValve_SetMode(PumpValveMode_t mode);
+/** 仅当 Linux 与基站通信均在线时允许排水；撤销时立即关闭排水。 */
+void PumpValve_SetDrainAllowed(uint8_t allowed);
 PumpValveMode_t PumpValve_GetMode(void);
 void PumpValve_TaskProcess(void);
 uint8_t PumpValve_IsPumpOn(void);

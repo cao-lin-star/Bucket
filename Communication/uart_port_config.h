@@ -13,6 +13,11 @@
 #define UART_PORT_PROTOCOL_BAUD         115200U
 #endif
 
+/* 桶体与基站的独立通信波特率；两端必须保持一致。 */
+#ifndef UART_PORT_BASE_BAUD
+#define UART_PORT_BASE_BAUD             9600U
+#endif
+
 #ifndef UART_PORT_LOGGING_BAUD
 #define UART_PORT_LOGGING_BAUD          115200U
 #endif

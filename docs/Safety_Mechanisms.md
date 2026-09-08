@@ -18,7 +18,10 @@
 | 排水超时保护 | 排水超过 8 min 水位仍 > 0 L | 关闭水泵，上报水泵故障 | `PumpValve_TaskProcess` |
 | 电机过流保护 | 电机运行时电流 > 2100 mA | 停止电机，上报电机故障 | `Motor_TaskProcess` |
 | 电池电压保护 | 电池 < 20.0 V 或 > 26.0 V | 上报电池故障；低压时停止所有输出并进入低电状态 | `SystemMonitor_TaskProcess` |
-| 主控通信超时保护 | 5 s 未收到主控合法帧 | 停止所有输出、清定时、进入待机 | `UART_Comm_HandleMainTimeout` |
+| 主控通信超时保护 | 5 s 未收到主控合法帧 | 持续停止全部输出和充电、撤销排水授权、通知基站安全停机 | `UART_Comm_HandleMainTimeout` |
+| 基站通信超时保护 | DCIN 无效、3 s 无合法回帧或 `frame[4]=0` | 立即撤销排水授权、停止桶体当前输出与充电，并尝试通知基站停机 | `UART_Comm_HandleBaseTimeout` |
+| 排水双链路门禁 | Linux 或基站任一不在线 | `PumpValve_SetMode(DRAIN)` 在执行层拒绝排水；运行中撤权则立即关闭 | `PumpValve_SetDrainAllowed` |
+| 充电双链路互锁 | Linux 或基站任一不在线 | 立即拉低 `DCIN_ON` 并清除 10 s 充电启动延时 | `PowerManager_TaskProcess`, `PowerManager_ForceOff` |
 | 定时关机保护 | 定时倒计时结束 | 停止所有输出、进入待机 | `SystemMonitor_TaskProcess` |
 | 停止/待机/低功耗/复位命令 | 收到对应通信命令 | 停止所有输出，复位命令延时后重启 MCU | `UART_Comm_ProcessBucketCommand`, `UART_Comm_ProcessSystemCommand`, `SystemMonitor_TaskProcess` |
 | UART 帧校验与 DMA 错误恢复 | 帧头/校验和错误或 UART DMA 异常 | 丢弃非法帧；DMA 错误时重启接收 | `UART_Comm_IsFrameValid`, `UART_Comm_ErrorCallback` |
@@ -163,6 +166,11 @@ if ((pump_mode == PUMP_VALVE_MODE_DRAIN) &&
   PumpValve_SetMode(PUMP_VALVE_MODE_OFF);
 }
 ```
+
+通信门禁：
+
+- 排水除了过流和 8 分钟超时保护，还必须同时满足 Linux 在线与基站双向在线。
+- `PumpValve_SetDrainAllowed(0)` 会立即结束正在运行的排水；之后所有进入排水的调用都会在 `PumpValve_SetMode()` 中被降级为 `OFF`。
 
 取消方式：
 

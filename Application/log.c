@@ -69,6 +69,7 @@ static uint8_t logging_tx_dma_buffer[LOGGING_TX_DMA_CHUNK_LEN];
 static volatile uint16_t logging_tx_head;
 static volatile uint16_t logging_tx_tail;                   //环形缓冲区尾索引
 static volatile uint8_t logging_dma_busy;                   //DMA 发送忙标志
+static uint32_t logging_last_periodic_tick;                 // 上次周期状态日志时间
 
 // Restore interrupt state.
 static void Logging_RestoreIrq(uint32_t primask)
@@ -197,6 +198,7 @@ void Logging_Init(void)
   logging_tx_tail = 0U;
   logging_dma_busy = 0U;
   logging_last_status = HAL_OK;
+  logging_last_periodic_tick = HAL_GetTick();
   Logging_RestoreIrq(primask);
   UART_PORT_LOGGING->Init.BaudRate = UART_PORT_LOGGING_BAUD;
   (void)HAL_UART_Init(UART_PORT_LOGGING);
@@ -272,6 +274,15 @@ void Logging_TaskProcess(void)
   uint16_t dcin_dv;
   uint8_t base_connected;
   uint8_t charging_enabled;
+  uint32_t now_tick;
+
+  /* 日志任务每 50 ms 服务命令，但完整状态行仍严格限制为每秒一次。 */
+  now_tick = HAL_GetTick();
+  if ((uint32_t)(now_tick - logging_last_periodic_tick) < 1000UL)
+  {
+    return;
+  }
+  logging_last_periodic_tick = now_tick;
   temp_x10 = Sensor_GetTemperatureCx10();
   sign = '+';
   if (temp_x10 < 0)
@@ -350,6 +361,7 @@ void Logging_TaskProcess(void)
                  SystemMonitor_GetErrCode1(),
                  SystemMonitor_GetErrCode2());
 #endif
+  UART_Comm_LogDockStatus();
 }
 
 // Get last logging status.
@@ -386,6 +398,11 @@ void Logging_ErrorCallback(UART_HandleTypeDef *huart)
     return;
   }
 
+  if (((huart->ErrorCode & HAL_UART_ERROR_DMA) == 0U) ||
+      (logging_dma_busy == 0U))
+  {
+    return;
+  }
   logging_last_status = HAL_ERROR;
   ATOMIC_CLEAR_BIT(huart->Instance->CR3, USART_CR3_DMAT);
   ATOMIC_CLEAR_BIT(huart->Instance->CR1, USART_CR1_TCIE);

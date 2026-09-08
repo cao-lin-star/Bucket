@@ -1,4 +1,5 @@
 #include "rtos_tasks.h"
+#include "config_console.h"
 
 #include "cmsis_os.h"
 #include "log.h"
@@ -13,7 +14,7 @@
 
 /*
  * 任务周期沿用重构前配置：传感器/电机 20 ms，泵阀/通信/系统监控 50 ms，
- * 温控 100 ms，UV 500 ms，日志 1000 ms。修改周期前需重新评估保护响应时间。
+ * 温控 100 ms，UV 500 ms；日志任务 50 ms 响应命令，状态行仍每 1000 ms 输出。
  */
 void RtosTasks_Sensor(void *argument)
 {
@@ -61,7 +62,7 @@ void RtosTasks_UvLamp(void *argument)
   for (;;)
   {
     UV_TaskProcess();
-    osDelay(500U);
+    osDelay(50U);
   }
 }
 
@@ -80,8 +81,12 @@ void RtosTasks_Logging(void *argument)
   (void)argument;
   for (;;)
   {
-    Logging_TaskProcess();
-    osDelay(1000U);
+    ConfigConsole_TaskProcess();
+    if (ConfigConsole_IsPeriodicLogEnabled() != 0U)
+    {
+      Logging_TaskProcess();
+    }
+    osDelay(50U);
   }
 }
 

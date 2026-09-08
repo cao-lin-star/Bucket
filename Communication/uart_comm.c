@@ -1,7 +1,10 @@
 #include "uart_comm.h"
 #include "log.h"
+#include "FreeRTOS.h"
+#include "task.h"
 #include "main.h"
 #include "motor_control.h"
+#include "power_manager.h"
 #include "pump_valve.h"
 #include "sensor.h"
 #include "system_monitor.h"
@@ -31,11 +34,21 @@
 #define UART_COMM_BASE_TIMEOUT_MS        3000UL
 #endif
 
+/* Linux 未提供透传帧时，桶体用低优先级心跳独立维护基站链路。 */
+#ifndef UART_COMM_BASE_HEARTBEAT_PERIOD_MS
+#define UART_COMM_BASE_HEARTBEAT_PERIOD_MS 1000UL
+#endif
+
 #ifndef UART_COMM_BASE_DCIN_CONNECTED_DV
 /* AD_DCIN 高于 13.0 V 才认为桶体已接入基站电源，单位 0.1 V。 */
 #define UART_COMM_BASE_DCIN_CONNECTED_DV 130U
 #endif
-/* 两个协议串口统一强制为 115200 baud。 */
+
+/* 自动上水期间桶内循环泵允许启动的本地安全水量，单位 L。 */
+#ifndef UART_COMM_AUTO_FILL_CIRC_MIN_WATER_L
+#define UART_COMM_AUTO_FILL_CIRC_MIN_WATER_L 1.0f
+#endif
+/* Linux 主控保持 115200 baud，桶体与基站链路独立使用 9600 baud。 */
 #ifndef UART_COMM_FORCE_PROTOCOL_BAUD
 #define UART_COMM_FORCE_PROTOCOL_BAUD    1U
 #endif
@@ -61,10 +74,14 @@
 #define UART_CMD_BUCKET_STOP             0xA7U      /* 停止全部功能 */
 #define UART_CMD_BUCKET_SELF_CHECK       0xA8U      /* 启动自检 */
 #define UART_CMD_BUCKET_LOW_POWER        0xA9U      /* 进入低功耗 */
+#define UART_CMD_BASE_STANDBY            0xB1U      /* 基站立即安全待机 */
 #define UART_CMD_BUCKET_AUTO_FILL        0xB2U      /* 自动补水：基站执行加/排水，桶体反馈水位和温度 */
 #define UART_CMD_DEBUG_PUMP_VALVE_ON     0xB4U      /* 调试：水泵开启并切到排水通路 */
 #define UART_CMD_SYSTEM_RESET            0xC0U      /* 系统复位 */
+#define UART_COMM_BASE_SAFE_STOP_MARKER  0xA5U      /* B1 frame[28] 安全停机标记 */
 /* 仅以下基站状态码会接管桶体泵阀模式。 */
+#define UART_BASE_STATUS_STANDBY         0x03U
+#define UART_BASE_STATUS_AUTO_FILL       0x04U
 #define UART_BASE_STATUS_CLEAN_DRAIN1    0x08U
 #define UART_BASE_STATUS_CLEAR_DRAIN2    0x0AU
 #define UART_BASE_STATUS_FORCE_DRAIN      0x0CU
@@ -95,6 +112,18 @@ typedef struct
   volatile uint8_t pending;
 } UartTxSlot_t;
 
+/* Ordered B2 bridge: first prove that Base consumed the current bucket snapshot. */
+typedef struct
+{
+  uint8_t pending;
+  uint8_t sequence;
+  uint8_t preface_token;
+  uint8_t command_token;
+  uint8_t water_l;
+  uint8_t temperature_c;
+  uint8_t command_frame[UART_COMM_FRAME_LEN];
+} UartAutoFillPreface_t;
+
 /* Linux 主控和基站各自维护解析器与接收槽，避免串口状态互相污染。 */
 static UartParser_t linux_parser;
 static UartParser_t base_parser;
@@ -114,12 +143,36 @@ static UartTxSlot_t base_tx_slot;
 /* 状态上报、链路看门狗和自检窗口所需的跨周期状态。 */
 static uint8_t base_data[13];
 static uint32_t base_last_rx_tick;
+/* 仅诊断：记录进入任务处理的已校验基站帧，包括模式被拒绝的帧。 */
+static uint32_t dock_rx_count;
+static uint32_t dock_rx_tick;
+static uint8_t dock_rx_mode;
+static uint8_t dock_rx_cmd;
+static uint8_t dock_rx_ack;
+static uint8_t dock_rx_status;
+/* 基站在返回帧 frame[4] 中确认其近期是否收到过桶体有效帧。 */
+static uint8_t base_reports_bucket_connected;
+/* 用于识别在线到离线的边沿，避免每个周期重复发送安全停机帧。 */
+static uint8_t base_link_was_connected;
+/* 掉线/复位后必须先确认基站执行安全 B1，禁止旧动作在重连时续跑。 */
+static uint8_t base_safe_stop_pending;
+static uint32_t base_last_tx_tick;
 static uint32_t main_last_rx_tick;
+/* 上电后至少收到一帧合法 Linux 数据，才允许把主控判为在线。 */
+static uint8_t main_frame_received;
 static uint32_t last_status_tx_tick;
 static uint8_t last_link_mode = UART_COMM_DEFAULT_LINK_MODE;
 static uint8_t main_timeout_handled;
 static uint8_t self_check_pending;
 static uint32_t self_check_start_tick;
+static uint8_t bucket_auto_fill_active;
+static uint8_t bucket_auto_fill_base_acknowledged;
+static uint8_t bucket_auto_fill_circulation_requested;
+static uint8_t bucket_auto_fill_circulation_owned;
+static uint32_t bucket_auto_fill_start_tick;
+static UartAutoFillPreface_t bucket_auto_fill_preface;
+
+static void UART_Comm_SendBaseSafeStop(void);
 
 /* 临界区退出时只恢复调用前已开启的中断状态。 */
 static void UART_Comm_RestoreIrq(uint32_t primask)
@@ -155,13 +208,202 @@ static void UART_Comm_RecordMainFrame(const uint8_t *frame)
 
   last_link_mode = frame[2];
   main_last_rx_tick = HAL_GetTick();
+  main_frame_received = 1U;
   main_timeout_handled = 0U;
+  /* 当前帧已证明 Linux 在线；基站也在线时立即恢复排水授权。 */
+  PumpValve_SetDrainAllowed(UART_Comm_IsBaseConnected());
 }
-/* 主控掉线保护只执行一次；收到下一帧后才重新装载看门狗。 */
+
+static uint8_t UART_Comm_LocalFunctionsNeedCirculation(void)
+{
+  return ((Temp_IsEnabled() != 0U) || (UV_IsOn() != 0U)) ? 1U : 0U;
+}
+
+static uint8_t UART_Comm_IsAutoFillCirculationSafe(void)
+{
+  return ((Sensor_IsWaterSensorOk() != 0U) &&
+          (Sensor_GetWaterLiters() >= UART_COMM_AUTO_FILL_CIRC_MIN_WATER_L)) ?
+         1U : 0U;
+}
+
+/* 结束自动上水跟踪时，只关闭由本流程自行开启且没有其他业务需要的循环。 */
+static void UART_Comm_StopAutoFillTracking(void)
+{
+  uint8_t tracking_was_active;
+  uint8_t circulation_owned;
+
+  tracking_was_active = bucket_auto_fill_active;
+  circulation_owned = bucket_auto_fill_circulation_owned;
+  bucket_auto_fill_active = 0U;
+  bucket_auto_fill_base_acknowledged = 0U;
+  bucket_auto_fill_circulation_requested = 0U;
+  bucket_auto_fill_start_tick = 0UL;
+  bucket_auto_fill_preface.pending = 0U;
+  bucket_auto_fill_preface.preface_token = 0U;
+  bucket_auto_fill_preface.command_token = 0U;
+  bucket_auto_fill_preface.water_l = 0U;
+  bucket_auto_fill_preface.temperature_c = 0U;
+  memset(bucket_auto_fill_preface.command_frame, 0,
+         sizeof(bucket_auto_fill_preface.command_frame));
+
+  if ((tracking_was_active != 0U) &&
+      (UART_Comm_LocalFunctionsNeedCirculation() != 0U))
+  {
+    if (UART_Comm_IsAutoFillCirculationSafe() != 0U)
+    {
+      if (PumpValve_GetMode() != PUMP_VALVE_MODE_CIRCULATION)
+      {
+        PumpValve_SetMode(PUMP_VALVE_MODE_CIRCULATION);
+      }
+    }
+    else if (PumpValve_GetMode() == PUMP_VALVE_MODE_CIRCULATION)
+    {
+      PumpValve_SetMode(PUMP_VALVE_MODE_OFF);
+    }
+  }
+  else if ((circulation_owned != 0U) &&
+           (PumpValve_GetMode() == PUMP_VALVE_MODE_CIRCULATION))
+  {
+    PumpValve_SetMode(PUMP_VALVE_MODE_OFF);
+  }
+  bucket_auto_fill_circulation_owned = 0U;
+}
+
+/* Restore the reported state from actual local functions after fill exits. */
+static void UART_Comm_RestoreBucketStatusAfterAutoFill(void)
+{
+  uint8_t timer_min;
+  uint8_t running;
+
+  timer_min = SystemMonitor_GetTimerRemainingMin();
+  running = ((Temp_IsEnabled() != 0U) ||
+             (UV_IsOn() != 0U) ||
+             (Motor_GetLevel() != 0U) ||
+             (timer_min != 0U)) ? 1U : 0U;
+  SystemMonitor_SetMainStatus((running != 0U) ?
+                              BUCKET_STATUS_RUNNING :
+                              BUCKET_STATUS_STANDBY,
+                              timer_min);
+}
+
+static void UART_Comm_FinishAutoFillTracking(void)
+{
+  UART_Comm_StopAutoFillTracking();
+  UART_Comm_RestoreBucketStatusAfterAutoFill();
+}
+
+static void UART_Comm_StartAutoFillTracking(uint32_t now)
+{
+  bucket_auto_fill_active = 1U;
+  bucket_auto_fill_base_acknowledged = 0U;
+  bucket_auto_fill_circulation_requested = 0U;
+  bucket_auto_fill_circulation_owned = 0U;
+  bucket_auto_fill_start_tick = now;
+}
+
+static void UART_Comm_UpdateAutoFillCirculation(void)
+{
+  uint8_t circulation_safe;
+  uint8_t circulation_needed;
+
+  if (bucket_auto_fill_active == 0U)
+  {
+    return;
+  }
+
+  circulation_safe = UART_Comm_IsAutoFillCirculationSafe();
+  circulation_needed =
+    ((bucket_auto_fill_base_acknowledged != 0U) &&
+     (circulation_safe != 0U) &&
+     ((bucket_auto_fill_circulation_requested != 0U) ||
+      (UART_Comm_LocalFunctionsNeedCirculation() != 0U))) ? 1U : 0U;
+
+  /* 自动上水期间不允许遗留排水；水位安全门槛也高于 UV 循环请求。 */
+  if (PumpValve_GetMode() == PUMP_VALVE_MODE_DRAIN)
+  {
+    PumpValve_SetMode(PUMP_VALVE_MODE_OFF);
+  }
+
+  if (circulation_needed != 0U)
+  {
+    if (PumpValve_GetMode() != PUMP_VALVE_MODE_CIRCULATION)
+    {
+      PumpValve_SetMode(PUMP_VALVE_MODE_CIRCULATION);
+    }
+  }
+  else if (PumpValve_GetMode() == PUMP_VALVE_MODE_CIRCULATION)
+  {
+    PumpValve_SetMode(PUMP_VALVE_MODE_OFF);
+  }
+
+  bucket_auto_fill_circulation_owned =
+    ((bucket_auto_fill_base_acknowledged != 0U) &&
+     (circulation_safe != 0U) &&
+     (bucket_auto_fill_circulation_requested != 0U)) ? 1U : 0U;
+}
+
+static void UART_Comm_HandleBaseTimeout(uint32_t now)
+{
+  uint8_t base_connected;
+
+  base_connected = UART_Comm_IsBaseConnected();
+  if (base_connected != 0U)
+  {
+    base_link_was_connected = 1U;
+  }
+  else
+  {
+    /* 三项在线条件任一失效，先在泵阀底层撤销排水权限。 */
+    PumpValve_SetDrainAllowed(0U);
+    if (base_link_was_connected != 0U)
+    {
+      base_link_was_connected = 0U;
+      base_safe_stop_pending = 1U;
+      /* 若桶体 TX 仍可用，通知基站立即停止；本机输出和充电同时关闭。 */
+      UART_Comm_SendBaseSafeStop();
+      UART_Comm_StopAutoFillTracking();
+      SystemMonitor_StopAllOutputs();
+      PowerManager_ForceOff();
+      SystemMonitor_SetBathTimer(0U);
+      self_check_pending = 0U;
+      SystemMonitor_SetCommand(UART_CMD_BUCKET_STOP);
+      SystemMonitor_SetMainStatus(BUCKET_STATUS_STANDBY, 0U);
+      return;
+    }
+  }
+
+  if (bucket_auto_fill_active == 0U)
+  {
+    return;
+  }
+
+  UART_Comm_UpdateAutoFillCirculation();
+
+  if ((bucket_auto_fill_preface.pending != 0U) ||
+      (bucket_auto_fill_base_acknowledged == 0U))
+  {
+    /* Snapshot acknowledgement and the B2 result each use a 3 s window. */
+    if ((now - bucket_auto_fill_start_tick) >= UART_COMM_BASE_TIMEOUT_MS)
+    {
+      UART_Comm_FinishAutoFillTracking();
+    }
+    return;
+  }
+
+  if (base_connected == 0U)
+  {
+    UART_Comm_FinishAutoFillTracking();
+  }
+}
+
+/* Linux 掉线后持续保持安全输出，收到下一帧后才重新装载看门狗。 */
 static void UART_Comm_HandleMainTimeout(uint32_t now)
 {
   if (main_timeout_handled != 0U)
   {
+    PumpValve_SetDrainAllowed(0U);
+    SystemMonitor_StopAllOutputs();
+    PowerManager_ForceOff();
     return;
   }
 
@@ -170,8 +412,15 @@ static void UART_Comm_HandleMainTimeout(uint32_t now)
     return;
   }
 
+  UART_Comm_StopAutoFillTracking();
+  base_link_was_connected = 0U;
+  base_safe_stop_pending = 1U;
+  UART_Comm_SendBaseSafeStop();
+  PumpValve_SetDrainAllowed(0U);
   SystemMonitor_StopAllOutputs();   /* 主控通信超时后立即关闭全部输出。 */
+  PowerManager_ForceOff();          /* Linux 或基站任一掉线都不能保持充电。 */
   SystemMonitor_SetBathTimer(0U);   /* 同时取消定时，防止恢复通信后误触发。 */
+  self_check_pending = 0U;
   SystemMonitor_SetCommand(UART_CMD_BUCKET_STOP);
   SystemMonitor_SetMainStatus(BUCKET_STATUS_STANDBY, 0U);
   main_timeout_handled = 1U;
@@ -444,6 +693,12 @@ static void UART_Comm_SendFrame(UART_HandleTypeDef *huart, const uint8_t *frame)
     return;
   }
 
+  /* Linux 透传帧、业务命令和兜底心跳都共用此时间，避免重复发送心跳。 */
+  if (huart == UART_PORT_BASE)
+  {
+    base_last_tx_tick = HAL_GetTick();
+  }
+
   primask = __get_PRIMASK();
   __disable_irq();
   memcpy(slot->pending_frame, frame, UART_COMM_FRAME_LEN);
@@ -486,6 +741,132 @@ static void UART_Comm_ForwardToBase(const uint8_t *frame)
   }
 }
 
+/* 查询基站发送槽是否完全空闲；兜底心跳绝不覆盖活动帧或待发业务帧。 */
+static uint8_t UART_Comm_IsBaseTxIdle(void)
+{
+  uint32_t primask;
+  uint8_t idle;
+
+  primask = __get_PRIMASK();
+  __disable_irq();
+  idle = ((base_tx_slot.busy == 0U) && (base_tx_slot.pending == 0U)) ? 1U : 0U;
+  UART_Comm_RestoreIrq(primask);
+  return idle;
+}
+
+/*
+ * Linux 尚未切换到 0x02 时，桶体主动发送最小实时帧建立双向链路。
+ * 已有任何基站方向通信、发送槽繁忙或 B2 正在握手时，本心跳主动让路。
+ */
+static void UART_Comm_SendBaseHeartbeatIfNeeded(uint32_t now)
+{
+  uint8_t frame[UART_COMM_FRAME_LEN];
+
+  /* Linux 掉线后停止主动心跳，让基站自身的 5 s 看门狗也能进入安全态。 */
+  if (UART_Comm_IsMainConnected() == 0U)
+  {
+    return;
+  }
+  if (Sensor_GetDcinDeciVolt() <= UART_COMM_BASE_DCIN_CONNECTED_DV)
+  {
+    return;
+  }
+  if (base_safe_stop_pending != 0U)
+  {
+    if (((now - base_last_tx_tick) >= UART_COMM_BASE_HEARTBEAT_PERIOD_MS) &&
+        (UART_Comm_IsBaseTxIdle() != 0U))
+    {
+      UART_Comm_SendBaseSafeStop();
+    }
+    return;
+  }
+  if ((bucket_auto_fill_preface.pending != 0U) ||
+      ((bucket_auto_fill_active != 0U) &&
+       (bucket_auto_fill_base_acknowledged == 0U)))
+  {
+    return;
+  }
+  if ((now - base_last_tx_tick) < UART_COMM_BASE_HEARTBEAT_PERIOD_MS)
+  {
+    return;
+  }
+  if (UART_Comm_IsBaseTxIdle() == 0U)
+  {
+    return;
+  }
+
+  memset(frame, 0, sizeof(frame));
+  frame[0] = UART_COMM_HEAD1;
+  frame[1] = UART_COMM_HEAD2;
+  frame[2] = UART_COMM_LINK_MODE_TRANSIT;
+  frame[3] = UART_CMD_IDLE;
+  frame[5] = Sensor_GetWaterLevelProtocol();
+  frame[6] = UART_Comm_GetTemperatureProtocol();
+  frame[29] = UART_Comm_Checksum(frame);
+  UART_Comm_SendFrame(UART_PORT_BASE, frame);
+}
+
+/*
+ * B1 + frame[28]=0xA5 是桶体内部使用的立即安全停机帧。
+ * 它可以覆盖尚未发送的普通业务帧，优先让基站关闭全部输出。
+ */
+static void UART_Comm_SendBaseSafeStop(void)
+{
+  uint8_t frame[UART_COMM_FRAME_LEN];
+
+  if (Sensor_GetDcinDeciVolt() <= UART_COMM_BASE_DCIN_CONNECTED_DV)
+  {
+    return;
+  }
+
+  memset(frame, 0, sizeof(frame));
+  frame[0] = UART_COMM_HEAD1;
+  frame[1] = UART_COMM_HEAD2;
+  frame[2] = UART_COMM_LINK_MODE_TRANSIT;
+  frame[3] = UART_CMD_BASE_STANDBY;
+  frame[5] = Sensor_GetWaterLevelProtocol();
+  frame[6] = UART_Comm_GetTemperatureProtocol();
+  frame[28] = UART_COMM_BASE_SAFE_STOP_MARKER;
+  frame[29] = UART_Comm_Checksum(frame);
+  UART_Comm_SendFrame(UART_PORT_BASE, frame);
+}
+
+/* Queue B2 and first send a tokened realtime snapshot to Base. */
+static void UART_Comm_QueueAutoFillCommand(const uint8_t *frame)
+{
+  uint8_t preface_frame[UART_COMM_FRAME_LEN];
+  uint8_t sequence;
+
+  sequence = (uint8_t)((bucket_auto_fill_preface.sequence + 1U) & 0x7FU);
+  if (sequence == 0U)
+  {
+    sequence = 1U;
+  }
+  bucket_auto_fill_preface.sequence = sequence;
+  bucket_auto_fill_preface.preface_token = sequence;
+  bucket_auto_fill_preface.command_token = (uint8_t)(sequence | 0x80U);
+  bucket_auto_fill_preface.water_l = Sensor_GetWaterLevelProtocol();
+  bucket_auto_fill_preface.temperature_c = UART_Comm_GetTemperatureProtocol();
+
+  memcpy(bucket_auto_fill_preface.command_frame, frame,
+         sizeof(bucket_auto_fill_preface.command_frame));
+  bucket_auto_fill_preface.command_frame[7] =
+    bucket_auto_fill_preface.command_token;
+  bucket_auto_fill_preface.command_frame[29] =
+    UART_Comm_Checksum(bucket_auto_fill_preface.command_frame);
+
+  memcpy(preface_frame, frame, sizeof(preface_frame));
+  preface_frame[3] = UART_CMD_IDLE;
+  preface_frame[5] = bucket_auto_fill_preface.water_l;
+  preface_frame[6] = bucket_auto_fill_preface.temperature_c;
+  preface_frame[7] = bucket_auto_fill_preface.preface_token;
+  preface_frame[29] = UART_Comm_Checksum(preface_frame);
+
+  bucket_auto_fill_preface.pending = 1U;
+  bucket_auto_fill_start_tick = HAL_GetTick();
+  UART_Comm_SendFrame(UART_PORT_BASE, preface_frame);
+}
+
 /* B2 自动补水由基站执行水路动作，桶体停止加热并进入运行态。 */
 static void UART_Comm_ProcessAutoFillCommand(const uint8_t *frame)
 {
@@ -497,9 +878,25 @@ static void UART_Comm_ProcessAutoFillCommand(const uint8_t *frame)
   SystemMonitor_SetCommand(UART_CMD_BUCKET_AUTO_FILL);
   SystemMonitor_SetMainStatus(BUCKET_STATUS_RUNNING, 0U);
 
+  if (bucket_auto_fill_active == 0U)
+  {
+    UART_Comm_StopAutoFillTracking();
+    if ((PumpValve_GetMode() == PUMP_VALVE_MODE_DRAIN) ||
+        (PumpValve_GetMode() == PUMP_VALVE_MODE_CIRCULATION))
+    {
+      PumpValve_SetMode(PUMP_VALVE_MODE_OFF);
+    }
+
+    if (is_transit != 0U)
+    {
+      UART_Comm_StartAutoFillTracking(HAL_GetTick());
+    }
+  }
+
   if (is_transit != 0U)
   {
-    UART_Comm_ForwardToBase(frame);
+    /* Repeated B2 updates also use the ordered snapshot handshake. */
+    UART_Comm_QueueAutoFillCommand(frame);
   }
 }
 /* A0~A9 为桶体本地业务命令，集中在此更新执行器和系统状态。 */
@@ -522,18 +919,28 @@ static void UART_Comm_ProcessBucketCommand(const uint8_t *frame)
       break;
 
     case UART_CMD_BUCKET_OFF:
+      UART_Comm_StopAutoFillTracking();
       SystemMonitor_StopAllOutputs();
       SystemMonitor_SetBathTimer(0U);
       SystemMonitor_SetMainStatus(BUCKET_STATUS_OFF, 0U);
       break;
 
     case UART_CMD_BUCKET_STANDBY:
+      UART_Comm_StopAutoFillTracking();
       SystemMonitor_StopAllOutputs();
       SystemMonitor_SetBathTimer(0U);
       SystemMonitor_SetMainStatus(BUCKET_STATUS_STANDBY, 0U);
       break;
 
     case UART_CMD_BUCKET_TEMP_ON:
+      if (bucket_auto_fill_active != 0U)
+      {
+        /* 自动上水期间加热控制权属于基站，拒绝启动桶体本地恒温。 */
+        Temp_Enable(0U);
+        SystemMonitor_SetCommand(UART_CMD_BUCKET_AUTO_FILL);
+        SystemMonitor_SetMainStatus(BUCKET_STATUS_RUNNING, frame[9]);
+        break;
+      }
       Temp_SetTargetC((float)frame[6]);
       Temp_Enable(1U);
       /* 加热故障锁存时 Temp_Enable 会拒绝启动，此时不得单独开启循环泵。 */
@@ -546,7 +953,8 @@ static void UART_Comm_ProcessBucketCommand(const uint8_t *frame)
 
     case UART_CMD_BUCKET_TEMP_OFF:
       Temp_Enable(0U);
-      if (UV_IsOn() == 0U)
+      if ((UV_IsOn() == 0U) &&
+          (bucket_auto_fill_active == 0U))
       {
         PumpValve_SetMode(PUMP_VALVE_MODE_OFF);
       }
@@ -562,7 +970,11 @@ static void UART_Comm_ProcessBucketCommand(const uint8_t *frame)
       UV_Set(frame[8]);
  
       /* UV 故障锁存可能拒绝开启，泵阀和主状态必须依据实际输出而非请求值。 */
-      if (UV_IsOn() != 0U)
+      if (bucket_auto_fill_active != 0U)
+      {
+        UART_Comm_UpdateAutoFillCirculation();
+      }
+      else if (UV_IsOn() != 0U)
       {
         PumpValve_SetMode(PUMP_VALVE_MODE_CIRCULATION);
       }
@@ -579,12 +991,14 @@ static void UART_Comm_ProcessBucketCommand(const uint8_t *frame)
       break;
 
     case UART_CMD_BUCKET_STOP:
+      UART_Comm_StopAutoFillTracking();
       SystemMonitor_StopAllOutputs();
       SystemMonitor_SetBathTimer(0U);
       SystemMonitor_SetMainStatus(BUCKET_STATUS_STANDBY, 0U);
       break;
 
     case UART_CMD_BUCKET_SELF_CHECK:
+      UART_Comm_StopAutoFillTracking();
       SystemMonitor_StopAllOutputs();
       SystemMonitor_ClearErrors();
       SystemMonitor_SetMainStatus(BUCKET_STATUS_SELF_CHECK, 0U);
@@ -593,6 +1007,7 @@ static void UART_Comm_ProcessBucketCommand(const uint8_t *frame)
       break;
 
     case UART_CMD_BUCKET_LOW_POWER:
+      UART_Comm_StopAutoFillTracking();
       SystemMonitor_StopAllOutputs();
       SystemMonitor_SetMainStatus(BUCKET_STATUS_LOW_POWER, 0U);
       break;
@@ -608,18 +1023,23 @@ static void UART_Comm_ProcessSystemCommand(const uint8_t *frame)
   SystemMonitor_SetCommand(frame[3]);
   if (frame[3] == UART_CMD_SYSTEM_RESET)
   {
+    UART_Comm_StopAutoFillTracking();
     SystemMonitor_StopAllOutputs();
     SystemMonitor_RequestReset();
   }
 }
 
 #if (UART_COMM_ENABLE_DEBUG_B4_PUMP_VALVE != 0U)
-/* B4 调试命令会直接开启水泵并切到排水通路。 */
+/* B4 仍受排水双链路门禁；状态必须依据泵阀实际模式上报。 */
 static void UART_Comm_ProcessDebugPumpValveCommand(void)
 {
+  UART_Comm_StopAutoFillTracking();
   PumpValve_SetMode(PUMP_VALVE_MODE_DRAIN);
   SystemMonitor_SetCommand(UART_CMD_DEBUG_PUMP_VALVE_ON);
-  SystemMonitor_SetMainStatus(BUCKET_STATUS_RUNNING, 0U);
+  SystemMonitor_SetMainStatus((PumpValve_GetMode() == PUMP_VALVE_MODE_DRAIN) ?
+                              BUCKET_STATUS_RUNNING :
+                              BUCKET_STATUS_STANDBY,
+                              0U);
 }
 #endif
 
@@ -671,6 +1091,11 @@ static uint8_t UART_Comm_ProcessLinuxFrame(const uint8_t *frame)
   /* 透传模式先发给基站；B0~BF 命令归基站处理，桶体不重复执行。 */
   if (is_transit != 0U)
   {
+    if ((cmd >= 0xB0U) && (cmd <= 0xBFU) &&
+        (cmd != UART_CMD_BUCKET_AUTO_FILL))
+    {
+      UART_Comm_StopAutoFillTracking();
+    }
     UART_Comm_ForwardToBase(frame);
     if ((cmd >= 0xB0U) && (cmd <= 0xBFU))
     {
@@ -722,6 +1147,39 @@ static uint8_t UART_Comm_IsBaseCirculationStatus(uint8_t status)
 static void UART_Comm_SyncPumpValveFromBaseStatus(uint8_t status,
                                                   uint8_t circulation_requested)
 {
+  /* 旧状态帧或单向链路都无权启动排水；授权条件在执行层再次校验。 */
+  if ((UART_Comm_IsMainConnected() == 0U) ||
+      (UART_Comm_IsBaseConnected() == 0U))
+  {
+    PumpValve_SetDrainAllowed(0U);
+    return;
+  }
+  PumpValve_SetDrainAllowed(1U);
+
+  if ((bucket_auto_fill_active != 0U) &&
+      (status == UART_BASE_STATUS_AUTO_FILL))
+  {
+    if ((bucket_auto_fill_preface.pending != 0U) ||
+        (bucket_auto_fill_base_acknowledged == 0U))
+    {
+      return;
+    }
+    bucket_auto_fill_circulation_requested =
+      (circulation_requested != 0U) ? 1U : 0U;
+    UART_Comm_UpdateAutoFillCirculation();
+    return;
+  }
+
+  if (bucket_auto_fill_active != 0U)
+  {
+    if (bucket_auto_fill_base_acknowledged == 0U)
+    {
+      return;
+    }
+
+    UART_Comm_FinishAutoFillTracking();
+  }
+
   if (UART_Comm_IsBaseDrainStatus(status) != 0U)
   {
     PumpValve_SetMode(PUMP_VALVE_MODE_DRAIN);
@@ -742,7 +1200,27 @@ static void UART_Comm_SyncPumpValveFromBaseStatus(uint8_t status,
     PumpValve_SetMode(PUMP_VALVE_MODE_OFF);
   }
 }
-/* 只有透传模式的合法基站帧才更新基站数据和在线时间。 */
+
+/* Forward B2 only after Base echoes the tokened realtime snapshot. */
+static uint8_t UART_Comm_TryForwardPendingAutoFill(const uint8_t *frame,
+                                                   uint32_t now)
+{
+  if ((bucket_auto_fill_preface.pending == 0U) ||
+      (frame[5] != bucket_auto_fill_preface.water_l) ||
+      (frame[6] != bucket_auto_fill_preface.temperature_c) ||
+      (frame[7] != bucket_auto_fill_preface.preface_token))
+  {
+    return 0U;
+  }
+
+  bucket_auto_fill_preface.pending = 0U;
+  bucket_auto_fill_start_tick = now;
+  UART_Comm_SendFrame(UART_PORT_BASE,
+                      bucket_auto_fill_preface.command_frame);
+  return 1U;
+}
+
+/* Only valid transit-mode Base frames update cached data and link time. */
 static uint8_t UART_Comm_ProcessBaseFrame(const uint8_t *frame)
 {
   uint32_t now;
@@ -752,15 +1230,82 @@ static uint8_t UART_Comm_ProcessBaseFrame(const uint8_t *frame)
     return 0U;
   }
 
+  dock_rx_count++;
+  dock_rx_tick = HAL_GetTick();
+  dock_rx_mode = frame[2];
+  dock_rx_cmd = frame[3];
+  dock_rx_ack = frame[4];
+  dock_rx_status = frame[23];
+
   if (UART_Comm_IsTransitMode(frame[2]) == 0U)
   {
     return 0U;
   }
 
-  memcpy(base_data, &frame[16], sizeof(base_data));
-  UART_Comm_SyncPumpValveFromBaseStatus(frame[23], frame[28]);
   now = HAL_GetTick();
+  /* 先发布对端确认位；frame[4]=0 时立即按失败安全原则撤销排水。 */
+  base_reports_bucket_connected = (frame[4] != 0U) ? 1U : 0U;
+  if (base_reports_bucket_connected == 0U)
+  {
+    PumpValve_SetDrainAllowed(0U);
+  }
   base_last_rx_tick = now;
+  memcpy(base_data, &frame[16], sizeof(base_data));
+
+  if (base_safe_stop_pending != 0U)
+  {
+    PumpValve_SetDrainAllowed(0U);
+    if ((frame[3] == UART_CMD_BASE_STANDBY) &&
+        (frame[23] == UART_BASE_STATUS_STANDBY))
+    {
+      /* 基站已回显 B1 且进入待机，旧动作清除后才允许重新判在线。 */
+      base_safe_stop_pending = 0U;
+    }
+    else
+    {
+      UART_Comm_SendBaseSafeStop();
+    }
+    return 1U;
+  }
+
+  if (UART_Comm_TryForwardPendingAutoFill(frame, now) != 0U)
+  {
+    return 1U;
+  }
+
+  if ((frame[23] == UART_BASE_STATUS_AUTO_FILL) &&
+      (bucket_auto_fill_active == 0U))
+  {
+    Temp_Enable(0U);
+    if ((PumpValve_GetMode() == PUMP_VALVE_MODE_DRAIN) ||
+        (PumpValve_GetMode() == PUMP_VALVE_MODE_CIRCULATION))
+    {
+      PumpValve_SetMode(PUMP_VALVE_MODE_OFF);
+    }
+    UART_Comm_StartAutoFillTracking(now);
+    bucket_auto_fill_base_acknowledged = 1U;
+  }
+
+  if ((bucket_auto_fill_active != 0U) &&
+      (bucket_auto_fill_base_acknowledged == 0U))
+  {
+    if ((frame[3] != UART_CMD_BUCKET_AUTO_FILL) ||
+        (frame[7] != bucket_auto_fill_preface.command_token))
+    {
+      return 1U;
+    }
+
+    if (frame[23] == UART_BASE_STATUS_AUTO_FILL)
+    {
+      bucket_auto_fill_base_acknowledged = 1U;
+    }
+    else
+    {
+      UART_Comm_FinishAutoFillTracking();
+    }
+  }
+
+  UART_Comm_SyncPumpValveFromBaseStatus(frame[23], frame[28]);
   return 1U;
 }
 /* 组装状态快照；基站离线时不带入上次缓存的基站数据。 */
@@ -803,9 +1348,16 @@ uint8_t UART_Comm_BuildStatusFrame(uint8_t *frame)
   return UART_COMM_FRAME_LEN;
 }
 
-/* 基站在线需要同时满足 DCIN 接入且近期收到合法基站帧。 */
+/*
+ * 基站在线需要同时满足：DCIN 接入、近期收到合法基站帧，以及基站确认
+ * 它也收到了桶体有效帧。最后一项用于识别桶体 TX 单向断线。
+ */
 uint8_t UART_Comm_IsBaseConnected(void)
 {
+  if (base_safe_stop_pending != 0U)
+  {
+    return 0U;
+  }
   if (Sensor_GetDcinDeciVolt() <= UART_COMM_BASE_DCIN_CONNECTED_DV)
   {
     return 0U;
@@ -816,9 +1368,62 @@ uint8_t UART_Comm_IsBaseConnected(void)
   }
   if ((HAL_GetTick() - base_last_rx_tick) < UART_COMM_BASE_TIMEOUT_MS)
   {
-    return 1U;
+    return base_reports_bucket_connected;
   }
   return 0U;
+}
+
+/* 先复制诊断状态，恢复调度后再格式化/输出，避免日志占用调度临界区。 */
+void UART_Comm_LogDockStatus(void)
+{
+  uint32_t now;
+  uint32_t rx_count;
+  uint32_t rx_age;
+  uint32_t valid_age;
+  uint32_t main_age;
+  uint16_t dcin;
+  uint8_t online;
+  uint8_t main_online;
+  uint8_t pending;
+  uint8_t ack;
+  uint8_t mode;
+  uint8_t cmd;
+  uint8_t status;
+  uint8_t last_ack;
+
+  vTaskSuspendAll();
+  now = HAL_GetTick();
+  rx_count = dock_rx_count;
+  /* -1（输出为有符号十进制）表示尚未收到对应有效数据。 */
+  rx_age = (rx_count != 0UL) ? (now - dock_rx_tick) : 0xFFFFFFFFUL;
+  valid_age = (base_last_rx_tick != 0UL) ? (now - base_last_rx_tick) : 0xFFFFFFFFUL;
+  main_age = (main_frame_received != 0U) ? (now - main_last_rx_tick) : 0xFFFFFFFFUL;
+  dcin = Sensor_GetDcinDeciVolt();
+  online = UART_Comm_IsBaseConnected();
+  main_online = UART_Comm_IsMainConnected();
+  pending = base_safe_stop_pending;
+  ack = base_reports_bucket_connected;
+  mode = dock_rx_mode;
+  cmd = dock_rx_cmd;
+  last_ack = dock_rx_ack;
+  status = dock_rx_status;
+  (void)xTaskResumeAll();
+
+  Logging_Printf("[DOCK] ON:%u DC:%u.%uV PWR:%u LNX:%u LA:%ldms RX:%lu RA:%ldms VA:%ldms ACK:%u B1WAIT:%u LAST:%02X/%02X/%02X/%02X\r\n",
+                 online, dcin / 10U, dcin % 10U,
+                 (dcin > UART_COMM_BASE_DCIN_CONNECTED_DV) ? 1U : 0U,
+                 main_online, (long)main_age, (unsigned long)rx_count,
+                 (long)rx_age, (long)valid_age, ack, pending,
+                 mode, cmd, last_ack, status);
+}
+
+uint8_t UART_Comm_IsMainConnected(void)
+{
+  if ((main_frame_received == 0U) || (main_timeout_handled != 0U))
+  {
+    return 0U;
+  }
+  return ((HAL_GetTick() - main_last_rx_tick) < UART_COMM_MAIN_TIMEOUT_MS) ? 1U : 0U;
 }
 
 /* 外部同步解析入口：仅接受完整且校验正确的 30 字节帧。 */
@@ -848,16 +1453,34 @@ void UART_Comm_Init(void)
   linux_tx_slot.huart = UART_PORT_LINUX;
   base_tx_slot.huart = UART_PORT_BASE;
   base_last_rx_tick = 0UL;
+  dock_rx_count = 0UL;
+  dock_rx_tick = 0UL;
+  dock_rx_mode = 0U;
+  dock_rx_cmd = 0U;
+  dock_rx_ack = 0U;
+  dock_rx_status = 0U;
+  base_reports_bucket_connected = 0U;
+  base_link_was_connected = 0U;
+  base_safe_stop_pending = 1U;
+  base_last_tx_tick = 0UL;
   main_last_rx_tick = HAL_GetTick();
+  main_frame_received = 0U;
   last_status_tx_tick = 0UL;
   last_link_mode = UART_COMM_DEFAULT_LINK_MODE;
   main_timeout_handled = 0U;
   self_check_pending = 0U;
   self_check_start_tick = 0UL;
+  bucket_auto_fill_active = 0U;
+  bucket_auto_fill_base_acknowledged = 0U;
+  bucket_auto_fill_circulation_requested = 0U;
+  bucket_auto_fill_circulation_owned = 0U;
+  bucket_auto_fill_start_tick = 0UL;
+  memset(&bucket_auto_fill_preface, 0, sizeof(bucket_auto_fill_preface));
+  PumpValve_SetDrainAllowed(0U);
   /* UART 重新初始化完成后再启动 DMA，确保端口使用固定协议波特率。 */
 #if UART_COMM_FORCE_PROTOCOL_BAUD
   UART_PORT_LINUX->Init.BaudRate = UART_PORT_PROTOCOL_BAUD;
-  UART_PORT_BASE->Init.BaudRate = UART_PORT_PROTOCOL_BAUD;
+  UART_PORT_BASE->Init.BaudRate = UART_PORT_BASE_BAUD;
   HAL_UART_Init(UART_PORT_LINUX);
   HAL_UART_Init(UART_PORT_BASE);
 #endif
@@ -870,6 +1493,12 @@ void UART_Comm_TaskProcess(void)
   uint8_t frame[UART_COMM_FRAME_LEN];
   uint32_t now;
   /* 每周期最多取主控和基站各一帧；接收槽始终保留最新完整帧。 */
+  if (UART_Comm_FetchFrame(&base_rx_slot, frame) != 0U)
+  {
+    /* 先消费B2之前已缓存的基站帧，避免旧0x04确认本周期的新B2。 */
+    (void)UART_Comm_ProcessBaseFrame(frame);
+  }
+
   if (UART_Comm_FetchFrame(&linux_rx_slot, frame) != 0U)
   {
     if ((UART_Comm_ProcessLinuxFrame(frame) != 0U) &&
@@ -884,13 +1513,13 @@ void UART_Comm_TaskProcess(void)
     }
   }
 
-  if (UART_Comm_FetchFrame(&base_rx_slot, frame) != 0U)
-  {
-    (void)UART_Comm_ProcessBaseFrame(frame);
-  }
   /* 先执行安全/状态转换，再决定是否立即或按周期发送状态帧。 */
   now = HAL_GetTick();
   UART_Comm_HandleMainTimeout(now);
+  UART_Comm_HandleBaseTimeout(now);
+  PumpValve_SetDrainAllowed(((UART_Comm_IsMainConnected() != 0U) &&
+                             (UART_Comm_IsBaseConnected() != 0U)) ? 1U : 0U);
+  UART_Comm_SendBaseHeartbeatIfNeeded(now);
   if (UART_Comm_HandleSelfCheckCompletion(now) != 0U)
   {
     last_status_tx_tick = now;
@@ -949,11 +1578,13 @@ void UART_Comm_ErrorCallback(UART_HandleTypeDef *huart)
   if (huart == UART_PORT_LINUX)
   {
     UART_Comm_StopReceiveOne(UART_PORT_LINUX);
+    linux_parser.index = 0U;
     (void)UART_Comm_StartReceiveOne(UART_PORT_LINUX, linux_rx_dma_buffer, &linux_rx_dma_pos);
   }
   else if (huart == UART_PORT_BASE)
   {
     UART_Comm_StopReceiveOne(UART_PORT_BASE);
+    base_parser.index = 0U;
     (void)UART_Comm_StartReceiveOne(UART_PORT_BASE, base_rx_dma_buffer, &base_rx_dma_pos);
   }
 
