@@ -204,6 +204,7 @@ static uint16_t Sensor_CalcPumpCurrentMa(uint16_t adc_mv)
                 (SENSOR_PUMP_CURRENT_SENSE_MOHM / 2U)) /
                SENSOR_PUMP_CURRENT_SENSE_MOHM;
 
+  /* 水泵电流缩小50倍*/
   current_ma = (current_ma + (SENSOR_PUMP_CURRENT_SCALE_DIV / 2U)) /
                SENSOR_PUMP_CURRENT_SCALE_DIV;
   if (current_ma > 65535U)
@@ -231,6 +232,10 @@ static uint16_t Sensor_CalcMotorCurrentMa(uint16_t adc_mv)
 
   current_ma = ((uint32_t)adc_mv * 1000U + (SENSOR_MOTOR_CURRENT_SENSE_MOHM / 2U)) /
                SENSOR_MOTOR_CURRENT_SENSE_MOHM;
+
+  /*电机电流缩小50倍*/
+  current_ma = (current_ma + (SENSOR_PUMP_CURRENT_SCALE_DIV / 2U)) /
+               SENSOR_PUMP_CURRENT_SCALE_DIV;
   if (current_ma > 65535U)
   {
     current_ma = 65535U;

@@ -83,12 +83,12 @@ extern "C" {
 #endif
 
 #ifndef SENSOR_PUMP_CURRENT_SCALE_DIV
-/* 当前硬件采样链路计算值需缩小 100 倍才是实际水泵电流。 */
-#define SENSOR_PUMP_CURRENT_SCALE_DIV   100U
+/* 当前水泵和电机硬件采样链路计算值需缩小 50 倍才是实际水泵电流。 */
+#define SENSOR_PUMP_CURRENT_SCALE_DIV   50U
 #endif
 
 #ifndef SENSOR_MOTOR_CURRENT_SENSE_MOHM
-#define SENSOR_MOTOR_CURRENT_SENSE_MOHM 150U
+#define SENSOR_MOTOR_CURRENT_SENSE_MOHM 15U
 #endif
 
 typedef enum

@@ -25,10 +25,10 @@ extern "C" {
 #define MOTOR_AUTO_REVERSE_MS        30000UL
 #endif
 
-// Motor overcurrent threshold: 2100mA, slightly below the 2.2A hardware limit.
+// Motor overcurrent threshold: 2000mA, slightly below the 2.2A hardware limit.
 // Stop the motor when the measured current exceeds this value.
 #ifndef MOTOR_CURRENT_MAX_MA
-#define MOTOR_CURRENT_MAX_MA         2100U
+#define MOTOR_CURRENT_MAX_MA         2000U
 #endif
 
 // ==================== 电机方向枚举 ====================
