@@ -47,6 +47,18 @@ void PowerManager_TaskProcess(void)
   uint32_t now;
 
   battery_dv = Sensor_GetBatteryDeciVolt();           // 电池电压（单位 0.1 V）
+  /* BAT_ON/WHEEL_ON: below 20V off, above 20V on, equal holds state. */
+  if (battery_dv < 200U)
+  {
+    HAL_GPIO_WritePin(BAT_ON_GPIO_Port, BAT_ON_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(WHEEL_ON_GPIO_Port, WHEEL_ON_Pin, GPIO_PIN_RESET);
+  }
+  else if (battery_dv > 200U)
+  {
+    HAL_GPIO_WritePin(BAT_ON_GPIO_Port, BAT_ON_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(WHEEL_ON_GPIO_Port, WHEEL_ON_Pin, GPIO_PIN_SET);
+  }
+
   base_connected = UART_Comm_IsBaseConnected();       // 基站双向在线状态
   main_connected = UART_Comm_IsMainConnected();       // Linux 主控在线状态
 
